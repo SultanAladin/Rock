@@ -49,3 +49,89 @@ export function maxResolutionFor(device) {
   const cells = Math.floor(cap / 16);
   return Math.floor(Math.cbrt(cells));
 }
+
+/**
+ * Prove the device can actually run a compute shader and a render pipeline
+ * before we blame our own solver.
+ *
+ * WGSL compile errors are asynchronous and non-fatal: createShaderModule
+ * resolves, createComputePipeline resolves, the dispatch quietly writes
+ * nothing. A black canvas is therefore ambiguous between "the GPU path is
+ * broken" and "my shader has a type error". This distinguishes them.
+ *
+ * @returns {Promise<{compute:boolean, render:boolean, errors:string[]}>}
+ */
+export async function selfTest(device, format = 'rgba8unorm') {
+  const errors = [];
+  let compute = false, render = false;
+
+  // ---- compute: write a known pattern and read it back --------------------
+  try {
+    device.pushErrorScope('validation');
+    const code = `
+@group(0) @binding(0) var<storage, read_write> outb : array<f32>;
+@compute @workgroup_size(4)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  outb[gid.x] = f32(gid.x) * 2.0 + 1.0;
+}`;
+    const module = device.createShaderModule({ code, label: 'selftest-compute' });
+    const info = await module.getCompilationInfo?.();
+    for (const m of info?.messages || []) {
+      if (m.type === 'error') errors.push(`selftest compute: ${m.message}`);
+    }
+    const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } });
+    const out = device.createBuffer({ size: 32, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const read = device.createBuffer({ size: 32, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const group = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: out } }],
+    });
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(pipeline); pass.setBindGroup(0, group); pass.dispatchWorkgroups(2); pass.end();
+    enc.copyBufferToBuffer(out, 0, read, 0, 32);
+    device.queue.submit([enc.finish()]);
+    await read.mapAsync(GPUMapMode.READ);
+    const got = new Float32Array(read.getMappedRange().slice(0));
+    read.unmap();
+    compute = got[0] === 1 && got[3] === 7;
+    if (!compute) errors.push(`selftest compute wrote [${Array.from(got.slice(0, 4))}], expected [1,3,5,7]`);
+    out.destroy(); read.destroy();
+    const e = await device.popErrorScope();
+    if (e) errors.push(`selftest compute validation: ${e.message}`);
+  } catch (e) {
+    errors.push(`selftest compute threw: ${e.message}`);
+  }
+
+  // ---- render: a pipeline with a storage buffer bound to the FRAGMENT stage
+  // (the configuration the raymarcher depends on)
+  try {
+    device.pushErrorScope('validation');
+    const code = `
+@group(0) @binding(0) var<storage, read> data : array<f32>;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+  var p = array<vec2<f32>, 3>(vec2f(-1,-1), vec2f(3,-1), vec2f(-1,3));
+  return vec4<f32>(p[i], 0.0, 1.0);
+}
+@fragment fn fs() -> @location(0) vec4<f32> {
+  return vec4<f32>(data[0], 0.0, 0.0, 1.0);
+}`;
+    const module = device.createShaderModule({ code, label: 'selftest-render' });
+    const info = await module.getCompilationInfo?.();
+    for (const m of info?.messages || []) {
+      if (m.type === 'error') errors.push(`selftest render: ${m.message}`);
+    }
+    device.createRenderPipeline({
+      layout: 'auto',
+      vertex: { module, entryPoint: 'vs' },
+      fragment: { module, entryPoint: 'fs', targets: [{ format }] },
+    });
+    const e = await device.popErrorScope();
+    if (e) errors.push(`selftest render validation: ${e.message}`);
+    else render = true;
+  } catch (e) {
+    errors.push(`selftest render threw: ${e.message}`);
+  }
+
+  return { compute, render, errors };
+}

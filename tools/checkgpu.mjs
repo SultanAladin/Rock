@@ -37,6 +37,23 @@ globalThis.GPUMapMode = { READ: 1, WRITE: 2 };
 const log = [];
 let liveBuffers = 0;
 
+/**
+ * Queue/encoder ordering model.
+ *
+ * queue.writeBuffer is a QUEUE operation: it takes effect in submission order,
+ * NOT at the point in an encoder where you happen to call it. So a uniform
+ * written between two dispatches recorded in the SAME command buffer is seen by
+ * BOTH of them with the final value. That is invisible in a mock that only
+ * checks validity, and it silently broke the jump flood (every stride read the
+ * last jfaStep written, collapsing an O(log n) flood to single-cell
+ * propagation). We model real ordering: uniform state is snapshotted when a
+ * command buffer is FINISHED, and dispatches record the value they will
+ * actually observe.
+ */
+const uniformState = new Map();     // buffer id -> { offset -> value }
+const observed = [];                // { pipe, jfaStep }
+
+
 class MockBuffer {
   constructor(desc, id) {
     this.size = desc.size; this.usage = desc.usage; this.id = id;
@@ -66,14 +83,17 @@ class MockPass {
     }
   }
   dispatchWorkgroups(x, y, z) {
-    log.push({ op: 'dispatch', pipe: this.pipeline?.label, x, y, z });
+    const rec = { op: 'dispatch', pipe: this.pipeline?.label, x, y, z, _enc: this._enc };
+    log.push(rec);
+    this._enc._recorded.push(rec);
   }
   draw(n) { log.push({ op: 'draw', n }); }
   end() {}
 }
 
 class MockEncoder {
-  beginComputePass() { return new MockPass('compute'); }
+  constructor() { this._recorded = []; }
+  beginComputePass() { const p = new MockPass('compute'); p._enc = this; return p; }
   beginRenderPass(d) {
     check(d.colorAttachments?.[0]?.view, 'render pass without a view');
     return new MockPass('render');
@@ -90,10 +110,17 @@ class MockEncoder {
     check(!b.destroyed, 'clearBuffer on destroyed buffer');
     check(off + size <= b.size, 'clearBuffer overruns');
   }
-  finish() { return { _cmd: true }; }
+  finish() {
+    // Snapshot the uniform values these commands will actually see: the state
+    // as of submission, not as of recording.
+    const snap = new Map();
+    for (const [id, m] of uniformState) snap.set(id, new Map(m));
+    return { _cmd: true, _recorded: this._recorded, _snap: snap };
+  }
 }
 
 let nextId = 0;
+let pipeLabel = 'compute';
 const device = {
   limits: { maxStorageBufferBindingSize: 1 << 30, maxBufferSize: 1 << 30 },
   createBuffer: (d) => new MockBuffer(d, `buf${nextId++}`),
@@ -102,9 +129,10 @@ const device = {
   createShaderModule: (d) => {
     check(typeof d.code === 'string' && d.code.length > 500, 'shader module code too short');
     check(!d.code.includes('undefined'), 'shader source contains the literal "undefined"');
-    return { _mod: true, code: d.code };
+    pipeLabel = d.label || 'compute';
+    return { _mod: true, code: d.code, label: d.label };
   },
-  createComputePipeline: (d) => ({ label: d._name || 'compute', layout: d.layout }),
+  createComputePipeline: (d) => ({ label: pipeLabel, layout: d.layout }),
   createRenderPipeline: (d) => ({ label: 'render', layout: d.layout }),
   createBindGroup: (d) => {
     const layout = d.layout;
@@ -133,13 +161,31 @@ const device = {
   },
   queue: {
     writeBuffer: (b, off, data, dOff = 0, sz) => {
+      if (b.usage & U.UNIFORM) {
+        let m = uniformState.get(b.id);
+        if (!m) { m = new Map(); uniformState.set(b.id, m); }
+        const view = ArrayBuffer.isView(data) ? data : new Uint8Array(data);
+        const u32 = new Uint32Array(view.buffer, view.byteOffset + dOff,
+          Math.floor((sz ?? (view.byteLength - dOff)) / 4));
+        for (let i = 0; i < u32.length; i++) m.set(off + i * 4, u32[i]);
+      }
       check(!b.destroyed, 'writeBuffer on destroyed buffer');
       check(b.usage & U.COPY_DST, `writeBuffer target ${b.id} lacks COPY_DST`);
       const bytes = sz ?? (data.byteLength - dOff);
       check(off + bytes <= b.size,
         `writeBuffer overruns ${b.id}: ${off}+${bytes} > ${b.size}`);
     },
-    submit: (cmds) => { check(Array.isArray(cmds) && cmds.length, 'empty submit'); },
+    submit: (cmds) => {
+      check(Array.isArray(cmds) && cmds.length, 'empty submit');
+      for (const c of cmds) {
+        for (const rec of c._recorded || []) {
+          // jfaStep lives at byte offset 8 of Params
+          const paramsId = [...(c._snap?.keys() || [])][0];
+          const v = c._snap?.get(paramsId)?.get(8);
+          if (rec.pipe === 'JFA_STEP') observed.push(v);
+        }
+      }
+    },
   },
   createCommandEncoder: () => new MockEncoder(),
   addEventListener: () => {},
@@ -185,6 +231,19 @@ let mono = true;
 for (let i = 1; i < 6; i++) if (cdf[i] < cdf[i - 1] - 1e-6) mono = false;
 check(mono, `modeCDF not monotone: ${cdf.map((v) => v.toFixed(3))}`);
 check(Math.abs(cdf[5] - 1) < 1e-6, `modeCDF must end at 1, got ${cdf[5]}`);
+
+// ---- jump flood must see every stride -----------------------------------
+// This is the bug that produced a black screen: all strides collapsed to 1.
+{
+  const strides = observed.filter((v) => v !== undefined);
+  const uniq = [...new Set(strides)].sort((a, b) => b - a);
+  const wantStrides = [];
+  for (let st = 1 << Math.ceil(Math.log2(64)); st >= 1; st >>= 1) wantStrides.push(st);
+  check(uniq.length === wantStrides.length,
+    `jump flood must run each stride with its own jfaStep: saw [${uniq}], expected [${wantStrides}]`);
+  check(uniq[0] === 64 && uniq[uniq.length - 1] === 1,
+    `jump flood strides must span 64..1, got [${uniq}]`);
+}
 
 // ---- stepping -----------------------------------------------------------
 log.length = 0;

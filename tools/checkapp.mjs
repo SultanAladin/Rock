@@ -69,6 +69,10 @@ class Buf {
   destroy() { if (!this.destroyed) live--; this.destroyed = true; }
   async mapAsync() {
     this.m = new ArrayBuffer(this.size);
+    if (this.size === 32) {           // device self-test readback
+      new Float32Array(this.m).set([1, 3, 5, 7, 9, 11, 13, 15]);
+      return;
+    }
     if (this.size <= 16) {
       // Counter readback: pretend the solid is shrinking slowly, so the
       // survival guard is exercised rather than trivially satisfied.
@@ -120,11 +124,16 @@ const device = {
   createPipelineLayout: (d) => ({}),
   createShaderModule: (d) => {
     if (d.code.includes('undefined')) errors.push('shader contains "undefined"');
-    return {};
+    // Real devices report WGSL errors here, asynchronously. Model that, so the
+    // app's error-reporting path is itself exercised.
+    return { getCompilationInfo: async () => ({ messages: [] }) };
   },
-  createComputePipeline: () => ({}),
+  pushErrorScope() {},
+  popErrorScope: async () => null,
+  createComputePipeline: () => ({ getBindGroupLayout: () => ({ _auto: true }) }),
   createRenderPipeline: () => ({}),
   createBindGroup: (d) => {
+    if (d.layout && d.layout._auto) return {};
     const t = new Map(d.layout.entries.map((e) => [e.binding, e.buffer?.type]));
     const r = new Set(), w = new Set();
     for (const e of d.entries) {

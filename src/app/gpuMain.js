@@ -13,7 +13,7 @@
  * only runs when you press Export.
  */
 
-import { requestRockDevice, maxResolutionFor } from '../gpu/device.js';
+import { requestRockDevice, maxResolutionFor, selfTest } from '../gpu/device.js';
 import { ErosionEngine } from '../gpu/erosionEngine.js';
 import { OrbitCamera } from './camera.js';
 import { LITHOLOGIES, DEFAULT_PARAMS, makeBatchParams } from '../core/generator.js';
@@ -61,6 +61,24 @@ function fatal(msg, detail) {
   console.error(msg, detail);
 }
 
+/**
+ * Report WGSL compile errors and GPU validation errors on screen.
+ *
+ * Both are asynchronous and non-fatal in WebGPU: createShaderModule succeeds,
+ * createPipeline succeeds, the dispatch quietly does nothing, and you are left
+ * looking at a black canvas with a clean console. Anything that silent has to
+ * be interrogated deliberately.
+ */
+async function reportGpuProblems(where) {
+  const errs = await engine.diagnostics();
+  if (errs.length) {
+    fatal(`Shader compile error (${where})`,
+      `<pre>${errs.join('\n\n').replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]))}</pre>`);
+    return true;
+  }
+  return false;
+}
+
 // ------------------------------------------------------------------- boot
 let device, context, engine, ui, cam;
 let format = 'bgra8unorm';
@@ -81,6 +99,17 @@ async function boot() {
   if (!context) { fatal('Could not create a WebGPU canvas context'); return; }
   format = navigator.gpu.getPreferredCanvasFormat();
   context.configure({ device, format, alphaMode: 'opaque' });
+
+  // Prove the device can run compute + a fragment-stage storage buffer before
+  // blaming our own solver. Distinguishes "the GPU path is broken" from "my
+  // shader has a bug" -- a black canvas alone cannot.
+  const st = await selfTest(device, format);
+  if (!st.compute || !st.render) {
+    fatal('This GPU cannot run the solver',
+      `${st.compute ? '' : 'Compute self-test failed. '}${st.render ? '' : 'Render self-test failed. '}
+       <pre>${st.errors.join('\n')}</pre>`);
+    return;
+  }
 
   engine = new ErosionEngine(device, context, format);
   cam = new OrbitCamera(canvas, { distance: 2.6, target: [0, 0, 0] });
@@ -111,7 +140,27 @@ async function boot() {
     onExportAll: exportAll,
   });
 
+  // Validation errors during setup would otherwise be swallowed.
+  device.pushErrorScope('validation');
   restart();
+  const vErr = await device.popErrorScope();
+
+  if (await reportGpuProblems('startup')) return;
+  if (vErr) { fatal('WebGPU validation error during setup', vErr.message); return; }
+
+  // Verify the solver actually produced a solid. A fresh joint block that
+  // contains zero interior cells means the compute passes did not run or did
+  // not write anything -- the exact failure a black screen represents -- so say
+  // that plainly instead of presenting an empty viewport as success.
+  const inside = await engine.probeInside();
+  if (inside === 0) {
+    fatal('The solver produced an empty grid',
+      `INIT wrote no interior cells, so there is nothing to raymarch.
+       Grid ${engine.n}\u00b3, ${engine.faceCount} joint faces.
+       This is a solver bug, not a settings problem \u2014 please report it.`);
+    return;
+  }
+
   requestAnimationFrame(tick);
 }
 

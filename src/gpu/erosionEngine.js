@@ -103,20 +103,29 @@ export class ErosionEngine {
       ],
     });
 
-    const mk = (code, layouts) => d.createComputePipeline({
-      layout: d.createPipelineLayout({ bindGroupLayouts: layouts }),
-      compute: { module: d.createShaderModule({ code }), entryPoint: 'main' },
-    });
+    // Keep every module + its source. WGSL compile errors are asynchronous and
+    // non-fatal in WebGPU: createShaderModule and createPipeline both succeed,
+    // the draw silently produces nothing, and you get a black screen with no
+    // exception. diagnostics() below interrogates them properly.
+    this.modules = [];
+    const mk = (code, layouts, name) => {
+      const module = d.createShaderModule({ code, label: name });
+      this.modules.push({ name, module, code });
+      return d.createComputePipeline({
+        layout: d.createPipelineLayout({ bindGroupLayouts: layouts }),
+        compute: { module, entryPoint: 'main' },
+      });
+    };
     const only = [this.computeLayout];
     this.pipe = {
-      init:    mk(INIT_WGSL, [this.computeLayout, this.faceLayout]),
-      seed:    mk(JFA_SEED_WGSL, only),
-      jfa:     mk(JFA_STEP_WGSL, only),
-      resolve: mk(JFA_RESOLVE_WGSL, only),
-      shelter: mk(SHELTER_WGSL, only),
-      step:    mk(STEP_WGSL, only),
-      count:   mk(COUNT_WGSL, only),
-      retreat: mk(RETREAT_WGSL, only),
+      init:    mk(INIT_WGSL, [this.computeLayout, this.faceLayout], 'INIT'),
+      seed:    mk(JFA_SEED_WGSL, only, 'JFA_SEED'),
+      jfa:     mk(JFA_STEP_WGSL, only, 'JFA_STEP'),
+      resolve: mk(JFA_RESOLVE_WGSL, only, 'JFA_RESOLVE'),
+      shelter: mk(SHELTER_WGSL, only, 'SHELTER'),
+      step:    mk(STEP_WGSL, only, 'STEP'),
+      count:   mk(COUNT_WGSL, only, 'COUNT'),
+      retreat: mk(RETREAT_WGSL, only, 'RETREAT'),
     };
 
     // Render layout
@@ -129,13 +138,36 @@ export class ErosionEngine {
         { binding: 4, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
       ],
     });
-    const rmod = d.createShaderModule({ code: RAYMARCH_WGSL });
+    const rmod = d.createShaderModule({ code: RAYMARCH_WGSL, label: 'RAYMARCH' });
+    this.modules.push({ name: 'RAYMARCH', module: rmod, code: RAYMARCH_WGSL });
     this.renderPipe = d.createRenderPipeline({
       layout: d.createPipelineLayout({ bindGroupLayouts: [this.renderLayout] }),
       vertex: { module: rmod, entryPoint: 'vs' },
       fragment: { module: rmod, entryPoint: 'fs', targets: [{ format: this.format }] },
       primitive: { topology: 'triangle-list' },
     });
+  }
+
+  /**
+   * Ask every shader module for its compilation log.
+   *
+   * This is the only way to see a WGSL type error at runtime: the API reports
+   * them here rather than by throwing. Returns a list of human-readable errors
+   * with the offending source line quoted.
+   */
+  async diagnostics() {
+    const out = [];
+    for (const { name, module, code } of this.modules) {
+      if (!module.getCompilationInfo) continue;
+      const info = await module.getCompilationInfo();
+      const lines = code.split('\n');
+      for (const m of info.messages) {
+        if (m.type !== 'error') continue;
+        const src = (lines[m.lineNum - 1] || '').trim();
+        out.push(`${name}:${m.lineNum}:${m.linePos}  ${m.message}\n    ${src}`);
+      }
+    }
+    return out;
   }
 
   // --------------------------------------------------------------- buffers
@@ -384,6 +416,7 @@ export class ErosionEngine {
       sheetingCurvature: P.sheetingCurvature,
     });
     this._uploadFaces(block.faces);
+    this.faceCount = block.faces.length;
 
     const enc = this.device.createCommandEncoder();
     // INIT writes phi -> phiA and phi0.
@@ -409,17 +442,10 @@ export class ErosionEngine {
     this.lastInside = 0;
     this._countPending = false;
 
-    // Count the fresh block NOW. The survival guard compares against this
-    // number, so without an actual dispatch here the first readback returns
-    // whatever was in the buffer and the guard can fire on step one and
-    // silently end the solve before anything erodes.
-    const enc2 = this.device.createCommandEncoder();
-    enc2.clearBuffer(this.buf.counter, 0, 16);
-    this._dispatch(enc2, this.pipe.count,
-      this._bind({ phiIn: this.buf.phiA, aux: this.buf.phi0, auxOut: this.buf.retreat }));
-    enc2.copyBufferToBuffer(this.buf.counter, 0, this.buf.readback, 0, 4);
-    this.device.queue.submit([enc2.finish()]);
-    this.requestCount(true);
+    // The survival guard needs a baseline. probeInside() does the dispatch and
+    // the readback as one awaited unit; kicking off a second concurrent count
+    // here would race it for the single readback buffer.
+    this.probeInside().catch(() => {});
     return { faces: block.faces.length, totalSteps: this.totalSteps, dt: this.meta.dt };
   }
 
@@ -459,26 +485,44 @@ export class ErosionEngine {
    * pass that replaces the sequential fast sweep, and it is why the solver can
    * re-metrise mid-frame without a hitch.
    */
-  redistance(enc0) {
-    const enc = enc0 || this.device.createCommandEncoder();
+  /**
+   * Jump-flood redistancing. log2(n) passes, all fully parallel -- this is the
+   * pass that replaces the sequential fast sweep.
+   *
+   * Self-contained by necessity, NOT by preference. Each stride needs its own
+   * jfaStep value, and queue.writeBuffer is a QUEUE operation: it does not
+   * interleave with commands already recorded in an encoder. Batching the
+   * strides into one command buffer would make every dispatch read the LAST
+   * value written (stride 1), collapsing the jump flood to single-cell
+   * propagation and leaving the far field un-redistanced. So each stride is
+   * written and submitted in order. For the same reason this method must never
+   * accept a caller's encoder -- interleaving its submits with unsubmitted
+   * caller commands would silently reorder them.
+   */
+  redistance() {
     const b = this.buf;
+    const bytes = this.n ** 3 * 4;
 
-    this._dispatch(enc, this.pipe.seed,
+    const seedEnc = this.device.createCommandEncoder();
+    this._dispatch(seedEnc, this.pipe.seed,
       this._bind({ phiIn: b.phiA, seedIn: b.seedB, seedOut: b.seedA }));
+    this.device.queue.submit([seedEnc.finish()]);
 
     let src = b.seedA, dst = b.seedB;
-    for (let s = 1 << Math.ceil(Math.log2(this.n)); s >= 1; s >>= 1) {
-      this._setU32('jfaStep', s);
-      this._dispatch(enc, this.pipe.jfa,
+    for (let st = 1 << Math.ceil(Math.log2(this.n)); st >= 1; st >>= 1) {
+      this._setU32('jfaStep', st);
+      const e = this.device.createCommandEncoder();
+      this._dispatch(e, this.pipe.jfa,
         this._bind({ phiIn: b.phiA, seedIn: src, seedOut: dst }));
+      this.device.queue.submit([e.finish()]);
       const t = src; src = dst; dst = t;
     }
-    this._dispatch(enc, this.pipe.resolve,
-      this._bind({ phiIn: b.phiA, phiOut: b.phiB, seedIn: src, seedOut: dst }));
-    // resolve wrote into phiB; copy back so phiA is always the live field
-    enc.copyBufferToBuffer(b.phiB, 0, b.phiA, 0, this.n ** 3 * 4);
 
-    if (!enc0) this.device.queue.submit([enc.finish()]);
+    const fin = this.device.createCommandEncoder();
+    this._dispatch(fin, this.pipe.resolve,
+      this._bind({ phiIn: b.phiA, phiOut: b.phiB, seedIn: src, seedOut: dst }));
+    fin.copyBufferToBuffer(b.phiB, 0, b.phiA, 0, bytes);
+    this.device.queue.submit([fin.finish()]);
   }
 
   computeShelter(enc0) {
@@ -500,53 +544,92 @@ export class ErosionEngine {
    * Advance the erosion by up to `count` steps. Returns the number actually
    * taken. Cheap enough to call every animation frame.
    */
+  /**
+   * Advance the erosion by up to `count` steps. Returns the number actually
+   * taken. Cheap enough to call every animation frame.
+   *
+   * Steps are batched into one command buffer between redistancings. The
+   * redistance itself submits its own buffers (see redistance()), so the batch
+   * is flushed first -- otherwise its submits would jump ahead of the steps
+   * still sitting unsubmitted in this encoder.
+   */
   advance(count = 1) {
     if (this.done || !this.buf) return 0;
     const b = this.buf;
-    const enc = this.device.createCommandEncoder();
+    const bytes = this.n ** 3 * 4;
     let taken = 0;
 
-    for (let i = 0; i < count && this.step < this.totalSteps; i++) {
-      // STEP reads phiA, writes phiB, then we swap the *bindings* by copying.
-      // A true ping-pong would avoid the copy, but the redistance pass and the
-      // renderer both want a single canonical "phiA = current field", and at
-      // 64^3 the copy is 1 MB of on-device bandwidth -- far below the cost of
-      // the step itself.
-      // aux = shelter (read); auxOut must be a DIFFERENT buffer or the group
-      // aliases shelter as both readable and writable, which is invalid.
-      this._dispatch(enc, this.pipe.step,
-        this._bind({ phiIn: b.phiA, phiOut: b.phiB, aux: b.shelter, auxOut: b.retreat }));
-      enc.copyBufferToBuffer(b.phiB, 0, b.phiA, 0, this.n ** 3 * 4);
-      this.step++;
-      taken++;
+    while (taken < count && this.step < this.totalSteps) {
+      // How many steps until the next redistance boundary?
+      const untilRedist = this.redistanceEvery - (this.step % this.redistanceEvery);
+      const batch = Math.min(count - taken, this.totalSteps - this.step, untilRedist);
 
-      if (this.step % this.redistanceEvery === 0) {
-        this.redistance(enc);
-        this.computeShelter(enc);
+      const enc = this.device.createCommandEncoder();
+      for (let i = 0; i < batch; i++) {
+        // STEP reads phiA, writes phiB, then copies back. A true ping-pong
+        // would avoid the copy, but redistance and the renderer both want a
+        // canonical "phiA = current field", and at 64^3 the copy is 1 MB of
+        // on-device bandwidth -- far below the cost of the step itself.
+        this._dispatch(enc, this.pipe.step,
+          this._bind({ phiIn: b.phiA, phiOut: b.phiB, aux: b.shelter, auxOut: b.retreat }));
+        enc.copyBufferToBuffer(b.phiB, 0, b.phiA, 0, bytes);
+        this.step++;
+        taken++;
+      }
+      this.device.queue.submit([enc.finish()]);
+
+      if (this.step % this.redistanceEvery === 0 && this.step < this.totalSteps) {
+        this.redistance();
+        this.computeShelter();
       }
     }
 
-    // Survival guard / live volume: one atomic count, read back asynchronously
-    // so the frame never blocks on the GPU.
-    if (this.step % 8 < taken || this.step >= this.totalSteps) {
+    if (this.step >= this.totalSteps && !this.done) {
+      this.redistance();
+      this.computeShelter();
+      this.done = true;
+    }
+
+    this.computeRetreat();
+
+    // Survival guard / live volume. Skipped while a readback is in flight:
+    // copying into a mapped buffer is a validation error.
+    if (!this._countPending && (this.step % 8 < taken || this.done)) {
+      const enc = this.device.createCommandEncoder();
       enc.clearBuffer(b.counter, 0, 16);
-        this._dispatch(enc, this.pipe.count,
+      this._dispatch(enc, this.pipe.count,
         this._bind({ phiIn: b.phiA, aux: b.phi0, auxOut: b.retreat }));
       enc.copyBufferToBuffer(b.counter, 0, b.readback, 0, 4);
-      this._readbackQueued = true;
+      this.device.queue.submit([enc.finish()]);
+      this.requestCount();
     }
 
-    if (this.step >= this.totalSteps) {
-      this.redistance(enc);
-      this.computeRetreat(enc);
-      this.done = true;
-    } else {
-      this.computeRetreat(enc);
-    }
-
-    this.device.queue.submit([enc.finish()]);
-    if (this._readbackQueued) { this._readbackQueued = false; this.requestCount(); }
     return taken;
+  }
+
+  /**
+   * Blocking interior-cell count. Used once at startup to prove the solver
+   * actually produced a solid; the per-frame path uses requestCount instead.
+   */
+  async probeInside() {
+    const enc = this.device.createCommandEncoder();
+    enc.clearBuffer(this.buf.counter, 0, 16);
+    this._dispatch(enc, this.pipe.count,
+      this._bind({ phiIn: this.buf.phiA, aux: this.buf.phi0, auxOut: this.buf.retreat }));
+    enc.copyBufferToBuffer(this.buf.counter, 0, this.buf.readback, 0, 4);
+    this.device.queue.submit([enc.finish()]);
+    while (this._countPending) await new Promise((r) => setTimeout(r, 4));
+    this._countPending = true;
+    try {
+      await this.buf.readback.mapAsync(GPUMapMode.READ);
+      const v = new Uint32Array(this.buf.readback.getMappedRange().slice(0))[0];
+      this.buf.readback.unmap();
+      this.initialInside = v;
+      this.lastInside = v;
+      return v;
+    } finally {
+      this._countPending = false;
+    }
   }
 
   /** Non-blocking interior-cell count. */
