@@ -73,15 +73,21 @@ ${samplerFor('aux')}
 export const INIT_WGSL = /* wgsl */`
 ${PRELUDE}
 
-// Joint faces are uploaded as planes + roughness parameters.
-struct Face {
-  n     : vec4<f32>,   // xyz normal, w = plane offset d
-  u     : vec4<f32>,   // xyz in-plane basis, w = roughness RMS (metres)
-  v     : vec4<f32>,   // xyz in-plane basis, w = asperity wavelength
-  extra : vec4<f32>,   // x = hurst, y = seedOffset, z = lacunarity, w = unused
-};
-@group(1) @binding(0) var<storage, read> faces : array<Face>;
-@group(1) @binding(1) var<uniform> faceCount : vec4<u32>;
+// Joint faces.
+//
+// These are read through the seedIn binding rather than a second bind group.
+// WebGPU guarantees only 8 storage buffers per shader stage, and the shared
+// prelude already declares exactly 8; adding a ninth for the faces made INIT's
+// pipeline invalid on a conformant device. The JFA seed buffer is unused during
+// INIT and is already array<vec4<f32>>, which is exactly the shape a face is
+// (four vec4s), so the faces ride in that slot and the count comes from
+// P.flags. Costs nothing and keeps us inside the guaranteed minimum.
+//
+//   [i*4 + 0] = n.xyz, plane offset d
+//   [i*4 + 1] = u.xyz, roughness RMS (metres)
+//   [i*4 + 2] = v.xyz, asperity wavelength
+//   [i*4 + 3] = hurst, seedOffset, lacunarity, unused
+fn faceAt(i: u32, c: u32) -> vec4<f32> { return seedIn[i * 4u + c]; }
 
 // 2D self-affine fBm on the joint plane. Granite mode-I fracture surfaces are
 // self-affine with H ~ 0.75-0.85 across five decades, so this exponent is a
@@ -101,18 +107,21 @@ fn fbm2(x: f32, y: f32, seed: u32, H: f32, oct: i32) -> f32 {
 
 fn blockSDF(p: vec3<f32>) -> f32 {
   var d = -1e9;
-  let cnt = faceCount.x;
+  let cnt = P.flags;
   for (var i = 0u; i < cnt; i = i + 1u) {
-    let f = faces[i];
-    var pd = dot(f.n.xyz, p) - f.n.w;
-    let rough = f.u.w;
+    let fn0 = faceAt(i, 0u);
+    let fu  = faceAt(i, 1u);
+    let fv  = faceAt(i, 2u);
+    let fe  = faceAt(i, 3u);
+    var pd = dot(fn0.xyz, p) - fn0.w;
+    let rough = fu.w;
     let reach = rough * 4.0;
     // Band-limited roughness cannot move the surface further than a few sigma,
     // so skipping the fBm outside that shell is exact, not an approximation.
     if (rough > 0.0 && pd < reach && pd > -reach) {
-      let su = dot(p, f.u.xyz) / f.v.w;
-      let sv = dot(p, f.v.xyz) / f.v.w;
-      pd = pd - fbm2(su, sv, u32(f.extra.y), f.extra.x, 5) * rough;
+      let su = dot(p, fu.xyz) / fv.w;
+      let sv = dot(p, fv.xyz) / fv.w;
+      pd = pd - fbm2(su, sv, u32(fe.y), fe.x, 5) * rough;
     }
     d = max(d, pd);   // CSG intersection of half-spaces
   }

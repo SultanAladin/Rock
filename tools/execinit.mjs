@@ -45,8 +45,8 @@ engine.reset({
 
 // identify the buffers by what the engine recorded
 paramsBytes = writes.get(engine.buf.params._id);
-faceBytes   = writes.get(engine.faceBuf._id);
-faceCount   = new Uint32Array(writes.get(engine.faceCountBuf._id).slice().buffer)[0];
+faceBytes   = writes.get(engine.buf.seedA._id);   // faces now ride in the seed buffer
+faceCount   = engine.faceCount;
 console.log(`params ${paramsBytes.length} B, faces ${faceCount}, faceBytes ${faceBytes.length}`);
 const pf = new Float32Array(paramsBytes.slice().buffer);
 const pu = new Uint32Array(paramsBytes.slice().buffer);
@@ -61,16 +61,12 @@ const bindGroups = {
     0: new Uint8Array(paramsBytes),          // Params uniform
     1: new Float32Array(N3),                 // phiIn
     2: phiOut,                               // phiOut
-    3: new Float32Array(N3*4),               // seedIn
+    3: new Float32Array(new Uint8Array(faceBytes).buffer),   // seedIn = faces
     4: new Float32Array(N3*4),               // seedOut
     5: new Float32Array(N3),                 // aux
     6: auxOut,                               // auxOut
     7: new Uint32Array(4),                   // counter
     8: new Float32Array(N3),                 // phi0In
-  },
-  1: {
-    0: new Uint8Array(faceBytes),            // faces
-    1: new Uint32Array([faceCount,0,0,0]),   // faceCount
   },
 };
 

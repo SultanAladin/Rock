@@ -124,8 +124,30 @@ let pipeLabel = 'compute';
 const device = {
   limits: { maxStorageBufferBindingSize: 1 << 30, maxBufferSize: 1 << 30 },
   createBuffer: (d) => new MockBuffer(d, `buf${nextId++}`),
-  createBindGroupLayout: (d) => ({ _layout: true, entries: d.entries }),
-  createPipelineLayout: (d) => ({ _pl: true, groups: d.bindGroupLayouts }),
+  createBindGroupLayout: (d) => {
+    // Per-layout resource counts, checked against the guaranteed minimums.
+    let storage = 0, uniform = 0;
+    for (const e of d.entries) {
+      if (!e.buffer) continue;
+      if (e.buffer.type === 'uniform') uniform++; else storage++;
+    }
+    return { _layout: true, entries: d.entries, storage, uniform };
+  },
+  createPipelineLayout: (d) => {
+    // WebGPU's guaranteed minimums, summed across ALL bind groups in the
+    // layout, because the limit is per SHADER STAGE not per group. Exceeding
+    // one makes pipeline creation fail, and the only symptom you get later is
+    // "Invalid ComputePipeline ... is invalid due to a previous error" at
+    // setPipeline time -- which names neither the limit nor the pipeline.
+    const LIMITS = { storage: 8, uniform: 12 };
+    let storage = 0, uniform = 0;
+    for (const g of d.bindGroupLayouts) { storage += g.storage; uniform += g.uniform; }
+    check(storage <= LIMITS.storage,
+      `pipeline needs ${storage} storage buffers per stage, guaranteed max is ${LIMITS.storage}`);
+    check(uniform <= LIMITS.uniform,
+      `pipeline needs ${uniform} uniform buffers per stage, guaranteed max is ${LIMITS.uniform}`);
+    return { _pl: true, groups: d.bindGroupLayouts, storage, uniform };
+  },
   createShaderModule: (d) => {
     check(typeof d.code === 'string' && d.code.length > 500, 'shader module code too short');
     check(!d.code.includes('undefined'), 'shader source contains the literal "undefined"');
@@ -231,6 +253,9 @@ let mono = true;
 for (let i = 1; i < 6; i++) if (cdf[i] < cdf[i - 1] - 1e-6) mono = false;
 check(mono, `modeCDF not monotone: ${cdf.map((v) => v.toFixed(3))}`);
 check(Math.abs(cdf[5] - 1) < 1e-6, `modeCDF must end at 1, got ${cdf[5]}`);
+
+// ---- resource limits ----------------------------------------------------
+// (createPipelineLayout above asserts these as each pipeline is built.)
 
 // ---- jump flood must see every stride -----------------------------------
 // This is the bug that produced a black screen: all strides collapsed to 1.

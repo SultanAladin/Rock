@@ -96,17 +96,10 @@ export class ErosionEngine {
         { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: ro },
       ],
     });
-    this.faceLayout = d.createBindGroupLayout({
-      entries: [
-        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: ro },
-        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-      ],
-    });
-
     // Keep every module + its source. WGSL compile errors are asynchronous and
     // non-fatal in WebGPU: createShaderModule and createPipeline both succeed,
     // the draw silently produces nothing, and you get a black screen with no
-    // exception. diagnostics() below interrogates them properly.
+    // exception. diagnostics() interrogates them properly.
     this.modules = [];
     const mk = (code, layouts, name) => {
       const module = d.createShaderModule({ code, label: name });
@@ -118,7 +111,7 @@ export class ErosionEngine {
     };
     const only = [this.computeLayout];
     this.pipe = {
-      init:    mk(INIT_WGSL, [this.computeLayout, this.faceLayout], 'INIT'),
+      init:    mk(INIT_WGSL, only, 'INIT'),
       seed:    mk(JFA_SEED_WGSL, only, 'JFA_SEED'),
       jfa:     mk(JFA_STEP_WGSL, only, 'JFA_STEP'),
       resolve: mk(JFA_RESOLVE_WGSL, only, 'JFA_RESOLVE'),
@@ -188,7 +181,8 @@ export class ErosionEngine {
       phi0:    d.createBuffer({ size: f32, usage: S | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST }),
       shelter: d.createBuffer({ size: f32, usage: S | GPUBufferUsage.COPY_SRC }),
       retreat: d.createBuffer({ size: f32, usage: S | GPUBufferUsage.COPY_SRC }),
-      seedA:   d.createBuffer({ size: N3 * 16, usage: S }),
+      // seedA also receives the joint-face upload during INIT, hence COPY_DST.
+      seedA:   d.createBuffer({ size: N3 * 16, usage: S | GPUBufferUsage.COPY_DST }),
       seedB:   d.createBuffer({ size: N3 * 16, usage: S }),
       counter: d.createBuffer({ size: 16, usage: S | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST }),
       readback: d.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
@@ -210,6 +204,9 @@ export class ErosionEngine {
     this._free();
     if (this.exportBuf) { this.exportBuf.destroy(); this.exportBuf = null; }
   }
+
+  /** Storage buffers this pipeline layout needs per stage (guaranteed max 8). */
+  static storageBuffersPerStage() { return 8; }
 
   /**
    * Compute bind group. Every pass declares all eight bindings, so we just
@@ -426,9 +423,11 @@ export class ErosionEngine {
     // INIT writes the fresh block into phiA. phi0 is bound read-only at slot 8
     // for every pass, so it cannot also be a write target here; we snapshot it
     // with a device-side copy, which is cheaper than a second dispatch anyway.
+    // seedIn carries the faces (see _uploadFaces).
     this._dispatch(enc, this.pipe.init,
-      this._bind({ phiIn: this.buf.phiB, phiOut: this.buf.phiA, auxOut: this.buf.shelter }),
-      this.faceGroup);
+      this._bind({ phiIn: this.buf.phiB, phiOut: this.buf.phiA,
+                   seedIn: this.buf.seedA, seedOut: this.buf.seedB,
+                   auxOut: this.buf.shelter }));
     enc.copyBufferToBuffer(this.buf.phiA, 0, this.buf.phi0, 0, P.resolution ** 3 * 4);
     this.device.queue.submit([enc.finish()]);
 
@@ -449,9 +448,16 @@ export class ErosionEngine {
     return { faces: block.faces.length, totalSteps: this.totalSteps, dt: this.meta.dt };
   }
 
+  /**
+   * Upload the joint faces into the JFA seed buffer.
+   *
+   * Not a separate binding: WebGPU guarantees only 8 storage buffers per shader
+   * stage and the shared prelude already uses all 8. seedA is idle during INIT
+   * and is already array<vec4<f32>>, which is the exact shape of a face record,
+   * so the faces live there and the count travels in P.flags.
+   */
   _uploadFaces(faces) {
-    const d = this.device;
-    const stride = 16; // 4 x vec4
+    const stride = 16;                       // 4 x vec4<f32>
     const arr = new Float32Array(faces.length * stride);
     faces.forEach((fc, i) => {
       const o = i * stride;
@@ -460,23 +466,11 @@ export class ErosionEngine {
       arr[o + 8] = fc.v[0]; arr[o + 9] = fc.v[1]; arr[o + 10] = fc.v[2]; arr[o + 11] = fc.grain;
       arr[o + 12] = fc.hurst; arr[o + 13] = fc.so >>> 0; arr[o + 14] = fc.lac; arr[o + 15] = 0;
     });
-    if (this.faceBuf) this.faceBuf.destroy();
-    this.faceBuf = d.createBuffer({
-      size: Math.max(64, arr.byteLength),
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
-    d.queue.writeBuffer(this.faceBuf, 0, arr);
-    if (!this.faceCountBuf) {
-      this.faceCountBuf = d.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    if (arr.byteLength > this.buf.seedA.size) {
+      throw new Error(`too many joint faces for the seed buffer (${faces.length})`);
     }
-    d.queue.writeBuffer(this.faceCountBuf, 0, new Uint32Array([faces.length, 0, 0, 0]));
-    this.faceGroup = d.createBindGroup({
-      layout: this.faceLayout,
-      entries: [
-        { binding: 0, resource: { buffer: this.faceBuf } },
-        { binding: 1, resource: { buffer: this.faceCountBuf } },
-      ],
-    });
+    this.device.queue.writeBuffer(this.buf.seedA, 0, arr);
+    this._setU32('flags', faces.length);
   }
 
   // ----------------------------------------------------------- redistancing
