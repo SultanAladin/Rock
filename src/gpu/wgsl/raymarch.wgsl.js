@@ -355,9 +355,10 @@ fn acesTonemap(x: vec3<f32>) -> vec3<f32> {
 fn fs(in: VSOut) -> @location(0) vec4<f32> {
   let ndc = vec4<f32>(in.uv.x, in.uv.y, 1.0, 1.0);
   var wp = Cam.invViewProj * ndc;
-  let target = wp.xyz / wp.w;
+  // NB: not "target" -- that is a WGSL reserved keyword.
+  let farPoint = wp.xyz / wp.w;
   let ro = Cam.eye.xyz;
-  let rd = normalize(target - ro);
+  let rd = normalize(farPoint - ro);
 
   let sky = mix(vec3<f32>(0.055,0.065,0.080), vec3<f32>(0.10,0.13,0.18),
                 clamp(rd.y * 0.5 + 0.5, 0.0, 1.0));

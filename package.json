@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test": "node tools/checkwgsl.mjs && node tools/checkwgslrefs.mjs && node tools/checkgpu.mjs && node tools/checkcamera.mjs && node tools/checkapp.mjs && node tools/execshade.mjs && node tools/checkuniforms.mjs && node tools/checkglsl.mjs && node tools/checkwinding.mjs && node tools/checkhash.mjs",
+    "test": "node tools/checkwgsl.mjs && node tools/checkwgslrefs.mjs && node tools/checkwgsllint.mjs && node tools/checkgpu.mjs && node tools/checkcamera.mjs && node tools/checkapp.mjs && node tools/execshade.mjs && node tools/checkuniforms.mjs && node tools/checkglsl.mjs && node tools/checkwinding.mjs && node tools/checkhash.mjs",
     "preview": "vite preview --host 0.0.0.0"
   },
   "repository": {

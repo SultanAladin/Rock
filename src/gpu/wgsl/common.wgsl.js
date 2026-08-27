@@ -94,8 +94,15 @@ fn hashU32(xin: u32) -> u32 {
   return x;
 }
 fn hash3i(p: vec3<i32>, seed: u32) -> u32 {
-  let h = u32(p.x) * 0x8da6b343u ^ u32(p.y) * 0xd8163841u
-        ^ u32(p.z) * 0xcb1ab31fu ^ seed * 0x165667b1u;
+  // WGSL has no relative precedence between bitwise and arithmetic operators
+  // and REQUIRES explicit parentheses when they are mixed -- unlike C/GLSL/JS,
+  // where * binds tighter than ^. The grouping below is the one those languages
+  // imply, so this stays bit-identical to the JS and GLSL twins that
+  // tools/checkhash.mjs pins.
+  let h = (u32(p.x) * 0x8da6b343u)
+        ^ (u32(p.y) * 0xd8163841u)
+        ^ (u32(p.z) * 0xcb1ab31fu)
+        ^ (seed * 0x165667b1u);
   return hashU32(h);
 }
 fn u2f(h: u32) -> f32 { return f32(h) * (1.0 / 4294967296.0); }
