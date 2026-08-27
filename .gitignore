@@ -1,0 +1,4 @@
+node_modules/
+dist/
+tools/_*.mjs
+*.log
