@@ -1,0 +1,289 @@
+/* Rock — real-time SDF erosion simulator */
+:root {
+  --panel-bg: rgba(16, 18, 24, 0.82);
+  --panel-border: rgba(120, 130, 150, 0.16);
+  --accent: #7fb2ff;
+  --accent-2: #ffb45e;
+  --text: #e7eaf0;
+  --text-dim: #9aa2b2;
+  --chip-bg: rgba(255, 255, 255, 0.05);
+  --chip-hover: rgba(255, 255, 255, 0.11);
+  --radius: 12px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: #06070a;
+  color: var(--text);
+  font-family: "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  overflow: hidden;
+}
+
+#stage {
+  position: fixed;
+  inset: 0;
+}
+
+#glcanvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: grab;
+}
+#glcanvas:active { cursor: grabbing; }
+
+/* --- HUD --- */
+.hud {
+  position: fixed;
+  z-index: 10;
+  pointer-events: none;
+}
+
+#hud-top {
+  top: 14px;
+  left: 18px;
+  right: 18px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+.brand-title {
+  font-size: 22px;
+  font-weight: 800;
+  letter-spacing: 3px;
+  color: var(--text);
+}
+.brand-sub {
+  display: block;
+  font-size: 11px;
+  letter-spacing: 0.6px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+.fps {
+  font-size: 12px;
+  color: var(--text-dim);
+  background: rgba(255,255,255,0.04);
+  padding: 5px 10px;
+  border-radius: 20px;
+  pointer-events: auto;
+}
+
+#readout {
+  top: 74px;
+  left: 18px;
+}
+.rock-readout {
+  font-size: 13px;
+  color: rgba(231, 234, 240, 0.85);
+  background: rgba(16, 18, 24, 0.7);
+  padding: 7px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--panel-border);
+}
+
+/* --- Controls panel --- */
+#controls {
+  position: fixed;
+  top: 50%;
+  right: 16px;
+  transform: translateY(-50%);
+  width: 300px;
+  max-height: 88vh;
+  overflow-y: auto;
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius);
+  padding: 14px 14px 16px;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  z-index: 20;
+  pointer-events: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255,255,255,0.15) transparent;
+}
+#controls::-webkit-scrollbar { width: 6px; }
+#controls::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 3px; }
+
+.group { margin-bottom: 15px; }
+.group-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+  color: var(--text-dim);
+  margin: 4px 0 8px;
+}
+
+.picker { display: flex; flex-wrap: wrap; gap: 6px; }
+.picker-wrap { gap: 4px; }
+.chip {
+  background: var(--chip-bg);
+  border: 1px solid transparent;
+  color: var(--text);
+  font-size: 12px;
+  padding: 6px 9px;
+  border-radius: 7px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.chip:hover { background: var(--chip-hover); }
+.chip.active {
+  background: rgba(127, 178, 255, 0.18);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.ctl-ctl {
+  display: grid;
+  grid-template-columns: 1fr 108px 42px;
+  align-items: center;
+  gap: 8px;
+  margin: 7px 0;
+}
+.ctl-ctl label {
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ctl-track {
+  display: flex;
+  align-items: center;
+  height: 22px;
+}
+.ctl-track input[type="range"] {
+  width: 100%;
+  accent-color: var(--accent);
+  height: 4px;
+  background: transparent;
+  cursor: pointer;
+}
+.ctl-val {
+  font-size: 11px;
+  color: var(--text);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- Erosion scrubber bar --- */
+#eraser {
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  width: min(720px, 86vw);
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius);
+  padding: 12px 18px 14px;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  z-index: 30;
+  pointer-events: auto;
+}
+.eraser-label {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 6px;
+}
+.eraser-process {
+  font-size: 13px;
+  color: var(--text);
+  font-weight: 600;
+}
+.eraser-hint {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.eraser-track {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+#erosion-scrub {
+  flex: 1;
+  appearance: none;
+  -webkit-appearance: none;
+  height: 6px;
+  border-radius: 3px;
+  background: linear-gradient(90deg, #2b3350 0%, #3b4c74 40%, #6d5a86 70%, #8a5a5a 100%);
+  outline: none;
+  cursor: pointer;
+}
+#erosion-scrub::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  border: 3px solid var(--accent);
+  box-shadow: 0 0 8px rgba(127, 178, 255, 0.6);
+  cursor: grab;
+}
+#erosion-scrub::-moz-range-thumb {
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: #fff;
+  border: 3px solid var(--accent);
+  cursor: grab;
+}
+.eraser-percent {
+  font-size: 15px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  min-width: 48px;
+  text-align: right;
+}
+
+.erosion-play {
+  width: 38px;
+  height: 38px;
+  flex: none;
+  border-radius: 50%;
+  border: 1px solid var(--panel-border);
+  background: var(--chip-bg);
+  color: var(--text);
+  font-size: 15px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.erosion-play:hover { background: var(--chip-hover); border-color: var(--accent); }
+.erosion-play.playing { background: rgba(127, 178, 255, 0.22); border-color: var(--accent); }
+
+.webgl-fallback {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  max-width: 540px;
+  background: rgba(16, 18, 24, 0.94);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius);
+  padding: 26px 30px;
+  text-align: center;
+  z-index: 50;
+}
+.webgl-fallback h2 { margin: 0 0 8px; font-size: 20px; }
+.webgl-fallback p { color: var(--text-dim); line-height: 1.5; }
+.webgl-fallback code {
+  display: block;
+  margin-top: 12px;
+  color: #e59;
+  font-size: 11px;
+  word-break: break-word;
+}
+
+@media (max-width: 760px) {
+  #controls { width: 250px; right: 8px; }
+  .brand-sub { display: none; }
+  #eraser { left: 24px; right: 24px; width: auto; transform: none; }
+}

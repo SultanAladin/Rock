@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Rock — Real-Time Erosion Simulator (SDF / WebGL)</title>
+<link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <div id="stage">
+    <canvas id="glcanvas"></canvas>
+
+    <div id="hud-top" class="hud">
+      <div class="brand">
+        <span class="brand-title">ROCK</span>
+        <span class="brand-sub">real-time SDF erosion simulator</span>
+      </div>
+      <div id="fps" class="fps">— fps</div>
+    </div>
+
+    <div id="readout" class="hud">
+      <div id="rock-readout" class="rock-readout">—</div>
+    </div>
+
+    <div id="controls"></div>
+  </div>
+
+  <!-- Erosion "time" scrubber (the slider to rewind/rewind through erosion) -->
+  <div id="eraser" class="hud">
+    <div class="eraser-label">
+      <span id="erosion-process" class="eraser-process">Erosion: —</span>
+      <span class="eraser-hint">drag to scrub the rock through geologic time</span>
+    </div>
+    <div class="eraser-track">
+      <button id="erosion-play" class="erosion-play" title="Replay erosion over time">▶</button>
+      <input type="range" id="erosion-scrub" min="0" max="100" step="0.5" value="0" />
+      <div id="erosion-percent" class="eraser-percent">0%</div>
+    </div>
+  </div>
+
+  <script src="js/shaders.js"></script>
+  <script src="js/materials.js"></script>
+  <script src="js/renderer.js"></script>
+  <script src="js/ui.js"></script>
+  <script src="js/main.js"></script>
+</body>
+</html>
