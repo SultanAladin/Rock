@@ -1,13 +1,15 @@
 # Granite Boulder Forge
 
 A realtime procedural generator for **batches of geologically-derived granite boulders**, with
-crystal-scale surface texture and a real curvature-driven weathering simulation.
+crystal-scale surface texture and a real curvature-driven weathering simulation that runs
+**entirely on the GPU as WebGPU compute** — you watch the corners round, iteration by iteration.
 
 Run it:
 
 ```bash
 npm install
-npm run dev
+npm run dev     # needs a WebGPU browser: Chrome/Edge 113+, Safari 18+, Firefox 141+
+npm test        # static + headless validation (see "How this is tested")
 ```
 
 ---
@@ -112,23 +114,56 @@ size because crack paths deviate around and through crystals.
 
 ## Pipeline
 
+Everything below the line runs on the GPU. φ is created, eroded and displayed without ever
+returning to the CPU.
+
 ```
-1. STRUCTURE   joint sets → CSG half-space intersection → fresh block SDF
-2. PETROLOGY   Laguerre crystal aggregate → durability volume
-3. WEATHERING  curvature-driven level-set erosion (narrow band + velocity extension)
-4. MESHING     dual contouring with QEF vertex placement
-5. DETAIL      grain-scale differential micro-relief at mesh level
-6. ATTRIBUTES  bake retreat / shelter / curvature per vertex for the shader
+              ┌─ CPU ─────────────────────────────────────────────┐
+              │ joint sets → plane list (a dozen planes, not a grid)│
+              └─────────────────────┬─────────────────────────────┘
+                                    ↓ upload
+┌─ GPU compute ──────────────────────────────────────────────────┐
+│ INIT         analytic joint-block SDF evaluated over the grid    │
+│ JFA_SEED     sub-cell interface seeds from sign changes          │
+│ JFA_STEP     jump flood, log2(N) passes, halving stride          │
+│ JFA_RESOLVE  closest points → signed distance                    │
+│ SHELTER      short-range occlusion (gates the cavernous term)    │
+│ ┌ per iteration ───────────────────────────────────────────────┐ │
+│ │ STEP       curvature → saturating rate law → velocity         │ │
+│ │            extension → Godunov upwind update of φ             │ │
+│ │ COUNT      atomic interior-cell count (survival guard)        │ │
+│ │ RETREAT    φ − φ₀ = rind thickness, for shading               │ │
+│ └───────────────────────────────────────────────────────────────┘ │
+└─────────────────────┬──────────────────────────────────────────┘
+                      ↓ same buffer, no copy
+┌─ GPU render ───────────────────────────────────────────────────┐
+│ sphere-trace φ directly + crystal-aggregate surface shading      │
+└────────────────────────────────────────────────────────────────┘
+
+  Export only:  read φ back → dual contouring (QEF) → OBJ / PLY
 ```
 
-Weathering runs on the **volume, before meshing**, because rounding a corner is a geometric change
-to the solid, not a displacement of a surface. Anything faking it as surface displacement cannot
-produce a concave tafone or a flared base, and it always shows.
+**Why there is no bake.** The renderer raymarches the same storage buffer the solver writes, so
+every iteration is on screen the frame it happens, at zero extra cost. Previously φ lived in a
+worker's heap and each displayed frame needed a full CPU re-polygonisation, which made
+per-iteration preview structurally impossible rather than merely slow. Dual contouring now runs
+only when you ask for a mesh file.
 
-Meshing is **dual contouring, not marching cubes** — MC cannot represent the sharp arrises of a
-freshly jointed block and produces the sliver triangles and staircase normals that make procedural
-rocks read as CG. QEF vertex placement gives razor-sharp fresh joint edges *and* smooth weathered
-shoulders from the same field.
+**Redistancing had to change.** Fast sweeping is Gauss-Seidel — its efficiency comes from each cell
+reading a neighbour's already-updated value, which is inherently sequential and degenerates on a
+GPU. It is replaced by **jump flooding** (Rong & Tan): propagate the closest interface *point*
+rather than the distance, in log2(N) fully parallel passes with halving stride. Distance is then
+just `|p − seed|`, which is exact Euclidean distance — arguably more metric than the Eikonal
+approximation it replaces.
+
+Weathering still runs on the **volume, before meshing**, because rounding a corner is a geometric
+change to the solid, not a displacement of a surface. Anything faking it as surface displacement
+cannot produce a concave tafone or a flared base, and it always shows.
+
+Meshing, when you export, is **dual contouring, not marching cubes** — MC cannot represent the
+sharp arrises of a freshly jointed block and produces the sliver triangles and staircase normals
+that make procedural rocks read as CG. QEF vertex placement gives razor-sharp fresh joint edges
+*and* smooth weathered shoulders from the same field.
 
 ---
 
@@ -158,6 +193,17 @@ Several non-obvious things had to be right; each is documented at length in-sour
 - **CPU/GPU hash parity.** The crystal field is evaluated on both sides. `tools/checkhash.mjs`
   verifies the JS and GLSL hashes agree **bit-for-bit** — otherwise quartz micro-relief wouldn't
   line up with quartz colour, which is exactly the tell that makes procedural stone look painted.
+  The WGSL port uses the same constants and the same u32 wrapping semantics.
+- **Rindlets are pinned to φ₀, not φ.** The oxidation shells formed at the original surface, so the
+  erosion step reads the fresh-block field through a separate binding. Phasing them off the current
+  φ would make the spalling bands migrate inward with the retreating front.
+- **No `ptr<storage, …>` parameters.** Storage-pointer function parameters are a WGSL language
+  extension that is not guaranteed across implementations, and a shader that fails to compile is a
+  blank canvas rather than an error. The trilinear sampler is generated per buffer instead; the
+  validator rejects any reintroduction.
+- **Bind-group aliasing.** WebGPU forbids exposing one buffer as both `read-only-storage` and
+  `storage` in the same group. With defaulted binding slots this is easy to do by accident and
+  fails at draw time, so `ErosionEngine._bind` asserts it up front.
 
 Validation of the solver, resolution 56³:
 
@@ -177,12 +223,24 @@ sculpted. That is the correct signature.
 
 ## Batch generation
 
-Instances vary by log-normal size (matching real block-size distributions from joint spacing),
-weathering age, buried fraction, aspect, joint roughness, and optional lithology/joint-style mixes.
-Generation runs across a **worker pool** (one per core) with transferable buffers, so the solve
-never touches the render thread.
+A batch is a **list of parameter variants**, not a queue of simultaneous bakes. Instances vary by
+log-normal size (matching real block-size distributions from joint spacing), weathering age, buried
+fraction, aspect, joint roughness, and optional lithology/joint-style mixes.
 
-Live stats report mean Wadell sphericity against the field range, and total mass at 2680 kg/m³.
+Because a full solve is a few milliseconds of GPU time, switching between variants re-solves from
+scratch instantly — the numbered chips under *Count* are a picker, not a progress list. The default
+is **1**; `?count=N` overrides it from the address bar. *Export All* walks the list.
+
+## Live solve controls
+
+The solver runs inside the render loop, so the transport row operates a simulation that is already
+running: **pause/resume**, **single-step** one iteration, **restart**, and a **scrub bar** over the
+whole erosion history. Scrubbing backwards re-runs from the fresh block, which is fast enough to be
+indistinguishable from seeking.
+
+*Iterations per frame* trades solve speed against frame rate; *render scale* trades raymarch
+resolution against frame rate. Grid resolution costs solver accuracy, **not** frame time — the
+raymarcher's cost is per-pixel, not per-cell.
 
 ## Inspect modes
 
@@ -199,12 +257,37 @@ Shaded · Mineral map · Surface retreat · Shelter/AO · Mean curvature
 ```
 src/core/      rng · noise · grid (SDF, curvature, fast-sweep) · petrology
                joints · weathering · mesher · generator
-src/gpu/       rockMaterial.js + glsl/common.glsl.js  (hash/noise/grain, mirrors core)
-src/worker/    generation worker
-src/io/        OBJ / PLY exporters
-src/app/       viewer + control panel
-tools/         checkhash · checkglsl · checkuniforms   (static validation)
+                 ↳ the CPU reference implementation the WGSL is ported from,
+                   and still the code path used for export-time contouring
+src/gpu/        device.js        WebGPU adapter/device acquisition + limits
+                erosionEngine.js buffers, pipelines, uniform packing, solve loop
+                wgsl/common      Params struct · hash · noise · crystal aggregate
+                wgsl/erode       the eight compute passes
+                wgsl/raymarch    sphere tracing + granite surface shading
+                rockMaterial.js  the older GLSL raster material (kept for reference)
+src/io/         OBJ / PLY exporters
+src/app/        gpuMain.js viewer · camera.js orbit+mat4 · ui.js control panel
+tools/          validation, see below
 ```
+
+## How this is tested
+
+There is no browser, no GPU and no GL in the development environment, so "it builds" would say
+nothing about whether it runs. Instead:
+
+| tool | what it proves |
+|---|---|
+| `checkwgsl.mjs` | all 9 WGSL modules parse (`wgsl_reflect`); `Params` is 608 B / 16-B aligned; no truncation; no `ptr<storage>`; no oversized workgroups |
+| `checkgpu.mjs` | drives `ErosionEngine` against a **mock device enforcing the spec** — bind-group aliasing, buffer usage flags, copy/write bounds, use-after-destroy — over 25 lithology × joint-style combinations |
+| `checkapp.mjs` | boots the real app on mock DOM + WebGPU, runs 240 frames, then drives **every** slider to min/mid/max, every dropdown option, every chip and button, scrubs forwards and backwards, and exports a mesh |
+| `checkcamera.mjs` | `inv(VP)·VP = I`; the centre ray hits the target; +X maps to camera-right; WebGPU `z ∈ [0,1]` depth convention |
+| `checkuniforms.mjs` | all **51** `Params` members match the shader struct by name *and* offset |
+| `checkhash` / `checkglsl` / `checkwinding` | bit-exact hash parity, shader integrity, outward-facing triangles |
+
+These are not smoke tests. Bugs they caught during this rewrite: the survival guard compared
+against an uninitialised cell count and could end the solve on iteration one; three concurrent
+readbacks raced on a single staging buffer; export silently produced zero stats and no vertex
+attributes; and several bind groups aliased a buffer as read and write simultaneously.
 
 ## References
 
@@ -213,4 +296,7 @@ Farley, *Fast Spheroidal Weathering with Colluvium Deposition*, BYU 2011) · Dor
 *Modeling and Rendering of Weathered Stone*, SIGGRAPH 1999 · Peytavie et al., *Modeling Rocky
 Scenery using Implicit Blocks* · Fletcher/Buss/Brantley on coupled oxidation–dissolution–fracturing
 in the Rio Blanco quartz diorite · Hirata & Chigira on rindlet exfoliation of granite porphyry ·
-Adalsteinsson & Sethian on velocity extension · Zhao, fast sweeping for the Eikonal equation.
+Adalsteinsson & Sethian on velocity extension · Zhao, fast sweeping for the Eikonal equation ·
+Rong & Tan, *Jump Flooding in GPU with Applications to Voronoi Diagram and Distance Transform*
+(I3D 2006) · Paris et al., *Flexible Terrain Erosion* (The Visual Computer, 2024) on particle
+erosion applied directly to signed distance fields.
