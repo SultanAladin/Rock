@@ -280,17 +280,32 @@ export class GrainField {
    * Crystal-scale relief is not lost -- it reappears at mesh level in
    * microRelief(), where the resolution can actually carry it.
    */
-  durabilityCell(x, y, z, cell, samples = 8) {
-    // Stratified 2x2x2 offsets scaled to the cell, which integrates the cell
-    // volume rather than a point, at fixed cost.
-    const o = cell * 0.25;
-    let inv = 0, cnt = 0;
-    for (let k = -1; k <= 1; k += 2)
-      for (let j = -1; j <= 1; j += 2)
-        for (let i = -1; i <= 1; i += 2) {
-          inv += 1 / this.durability(x + i * o, y + j * o, z + k * o);
-          cnt++;
+  durabilityCell(x, y, z, cell) {
+    // QUADRATURE, not physics. A 30 mm cell holds ~640 crystals of 3.5 mm, so
+    // the converged Reuss mean varies very little from cell to cell (measured
+    // sd 0.016). A sparse estimate does NOT reproduce that: the sampling error
+    // of an M-sample mean falls only as sqrt(M/N), so the old 2x2x2 stencil
+    // returned sd 0.133 -- 8.2x the real variation, and *uncorrelated* between
+    // neighbouring cells because each cell drew a different set of crystals.
+    //
+    // That is white noise in the speed field. It pits the surface at exactly
+    // the grid frequency the level set cannot resolve, adding area while the
+    // corners are still trying to round: sphericity fell with age instead of
+    // rising. The cure is to converge the estimator, not to clamp the result.
+    // 4x4x4 stratified cuts the sampling error to ~1/3 for 8x the samples, and
+    // this is evaluated once per band cell per redistance interval, not per
+    // step, so the cost is not on the critical path.
+    const S = 4;
+    const step = cell / S;
+    const base = -0.5 * cell + 0.5 * step;
+    let inv = 0;
+    for (let k = 0; k < S; k++)
+      for (let j = 0; j < S; j++)
+        for (let i = 0; i < S; i++) {
+          inv += 1 / this.durability(x + base + i * step,
+                                     y + base + j * step,
+                                     z + base + k * step);
         }
-    return cnt / inv;   // harmonic mean
+    return (S * S * S) / inv;   // harmonic (Reuss) mean
   }
 }

@@ -100,6 +100,8 @@ export const DEFAULT_WEATHERING = {
   shelterRadius: 0.22,
   maxSteps: 1200,         // safety cap; the budget normally terminates first
   redistanceEvery: 12,
+  /** Rock radius in metres, for the retreat budget. Set by the caller. */
+  blockRadius: 0,
   bandWidth: 3.0,         // in cells
   /**
    * Rounding radius as a fraction of the block radius L. This is the length
@@ -221,7 +223,13 @@ export function weather(phi, grains, opts = {}, onProgress) {
   const P = { ...DEFAULT_WEATHERING, ...opts };
   const n = phi.n, h = phi.h;
   const N3 = n * n * n;
-  const L = phi.extent;                       // characteristic block radius
+  // Characteristic radius of the ROCK, which is what `years` is calibrated
+  // against. NOT phi.extent: the domain is padded around the block by a margin
+  // that varies with joint style (1.5x to 3.2x size), so tying the budget to it
+  // made `years` mean 14% retreat on one block and 46% on another. Callers pass
+  // the measured block radius; falling back to the extent preserves the old
+  // behaviour for callers that don't.
+  const L = P.blockRadius || phi.extent;
 
   const phi0 = phi.clone();
 
@@ -370,7 +378,7 @@ export function weather(phi, grains, opts = {}, onProgress) {
     return p * Math.pow(k, p - 1) / ((1 + kp2) * (1 + kp2));
   })();
   const bEff = P.spheroidal * bSup * (L * P.roundingRadius) * WEAK_MAX;
-  const dtDiff = (0.25 * h * h) / Math.max(1e-9, bEff);
+  const dtDiff = (0.15 * h * h) / Math.max(1e-9, bEff);
   const dt = Math.min(dtAdv, dtDiff);
   const stepsNeeded = Math.ceil(budget / dt);
   const steps = Math.max(1, Math.min(P.maxSteps, stepsNeeded));

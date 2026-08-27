@@ -248,14 +248,21 @@ fn durabilityAt(p: vec3<f32>) -> f32 {
 // white noise at grid scale and would grow fuzz instead of rounding the rock.
 // The front advances through the weakest connected path, hence harmonic.
 fn durabilityCell(p: vec3<f32>, cell: f32) -> f32 {
-  let o = cell * 0.25;
+  // 4x4x4 stratified. Must stay bit-identical to GrainField.durabilityCell in
+  // core/petrology.js -- see the note there for why 2x2x2 was white noise.
+  let S = 4;
+  let step = cell / 4.0;
+  let base = -0.5 * cell + 0.5 * step;
   var inv = 0.0;
-  for (var k = -1; k <= 1; k = k + 2) {
-  for (var j = -1; j <= 1; j = j + 2) {
-  for (var i = -1; i <= 1; i = i + 2) {
-    inv = inv + 1.0 / durabilityAt(p + vec3<f32>(f32(i), f32(j), f32(k)) * o);
+  for (var k = 0; k < S; k = k + 1) {
+  for (var j = 0; j < S; j = j + 1) {
+  for (var i = 0; i < S; i = i + 1) {
+    let q = p + vec3<f32>(base + f32(i) * step,
+                          base + f32(j) * step,
+                          base + f32(k) * step);
+    inv = inv + 1.0 / durabilityAt(q);
   }}}
-  return 8.0 / inv;
+  return 64.0 / inv;
 }
 `;
 

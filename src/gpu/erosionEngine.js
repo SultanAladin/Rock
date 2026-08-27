@@ -27,6 +27,7 @@ import { INIT_WGSL, JFA_SEED_WGSL, JFA_STEP_WGSL, JFA_RESOLVE_WGSL,
 import { RAYMARCH_WGSL } from './wgsl/raymarch.wgsl.js';
 import { MINERAL_LIST, LITHOLOGIES, buildModeCDF } from '../core/petrology.js';
 import { buildJointBlock } from '../core/joints.js';
+import { blockAxes } from '../core/generator.js';
 import { DEFAULT_WEATHERING } from '../core/weathering.js';
 
 const WG = 4;                       // workgroup_size(4,4,4)
@@ -255,6 +256,31 @@ export class ErosionEngine {
     pass.end();
   }
 
+  /**
+   * Build the joint block for these params (memoised on the param identity that
+   * affects geometry) and derive the domain extent from its actual support.
+   */
+  _blockFor(P) {
+    const litho = LITHOLOGIES[P.lithology] || LITHOLOGIES['biotite-granite'];
+    const key = [P.seed, P.jointStyle, P.size, P.aspectVariation, P.jointRoughness,
+                 P.hurst, litho.grain, P.sheetingCurvature].join('|');
+    if (this._blockKey !== key) {
+      const aspect = aspectFor(P.seed, P.aspectVariation ?? 0.28);
+      this._blockKey = key;
+      this._block = buildJointBlock({
+        seed: P.seed, style: P.jointStyle, size: P.size, aspect,
+        jointRoughness: P.jointRoughness, hurst: P.hurst,
+        grainSize: litho.grain, sheetingCurvature: P.sheetingCurvature,
+      });
+      const axes = blockAxes(this._block.sdf, P.size);
+      this._blockRadius = axes.min;          // budget scales with the THIN axis
+      this._blockExtent = axes.max * 1.06;   // domain must hold the LONG axis
+    }
+    return this._block;
+  }
+
+  _extentFor(P) { this._blockFor(P); return this._blockExtent; }
+
   // ------------------------------------------------------------ parameters
   /**
    * Pack the Params uniform. Everything the compute passes and the raymarcher
@@ -265,7 +291,13 @@ export class ErosionEngine {
     const litho = LITHOLOGIES[P.lithology] || LITHOLOGIES['biotite-granite'];
     const W = { ...DEFAULT_WEATHERING, ...(P.weathering || {}) };
     const n = P.resolution;
-    const extent = P.size * 0.95;
+    // Domain sized to the block's measured support, not a fixed fraction of
+    // P.size. Joint spacing is anisotropic so the block reaches ~1.4 * size on
+    // its long axis; the old 0.95 * size clipped it against the grid wall,
+    // where the solver freezes a boundary shell and the mesher cannot close the
+    // surface. Weathering only removes rock, so no extra retreat allowance is
+    // needed. Must match generateRock() in core/generator.js.
+    const extent = this._extentFor(P);
     const h = (2 * extent) / (n - 1);
 
     u[O.n] = n;
@@ -304,7 +336,7 @@ export class ErosionEngine {
     // the advective CFL is honest. The parabolic bound is evaluated at the
     // curvature where the diffusivity actually peaks (k ~ 1), not at grid
     // resolution, where it has already decayed by 1/k^2.
-    const L = extent;
+    const L = this._blockRadius || extent;   // rock radius, not padded domain
     const Fmax = (W.spheroidal + W.cavernous + W.uniform) * WEAK_MAX;
     const dtAdv = (0.45 * h) / Math.max(1e-6, Fmax);
     const p = W.spheroidalPower;
@@ -398,20 +430,7 @@ export class ErosionEngine {
     // Joint faces: geometry comes from the same CPU generator as before (it is
     // a handful of planes, not a grid, so there is nothing to gain from moving
     // it), but the SDF *evaluation* over 64^3 cells happens on the GPU.
-    const litho = this.meta.litho;
-    const rngSeed = P.seed;
-    const av = P.aspectVariation ?? 0.28;
-    const aspect = aspectFor(rngSeed, av);
-    const block = buildJointBlock({
-      seed: rngSeed,
-      style: P.jointStyle,
-      size: P.size,
-      aspect,
-      jointRoughness: P.jointRoughness,
-      hurst: P.hurst,
-      grainSize: litho.grain,
-      sheetingCurvature: P.sheetingCurvature,
-    });
+    const block = this._blockFor(P);
     this._uploadFaces(block.faces);
     this.faceCount = block.faces.length;
 

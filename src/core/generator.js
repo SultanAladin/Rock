@@ -41,6 +41,95 @@ export const DEFAULT_PARAMS = {
  * @param {object} params
  * @param {(f:number,label:string)=>void} [onProgress]
  */
+
+/**
+ * Largest radius at which the block is still solid, sampled over a spherical
+ * fan. Cheap (a few thousand SDF evaluations, once per rock) and far safer than
+ * assuming the block fits in size/2 -- joint spacing is anisotropic, so it does
+ * not.
+ */
+export function blockReach(sdf, size) {
+  // Half-extent of the ORIGIN-CONNECTED block, measured by flood fill on a
+  // coarse lattice.
+  //
+  // Radial ray marching is wrong here on two counts. The joint field tiles
+  // space, so a ray that keeps going measures the neighbouring blocks too; and
+  // a joint block is not star-shaped, so a ray that stops at the first exit
+  // under-measures a block that bulges back out off-axis. Flood fill answers
+  // the actual question -- how far does the connected lump the camera is
+  // looking at extend -- and is immune to both.
+  const M = 48;                       // lattice resolution for the probe
+  const span = size * 4;              // generous search box, half-width
+  const step = (2 * span) / (M - 1);
+  const at = (i, j, k) => (k * M + j) * M + i;
+  const solid = new Uint8Array(M * M * M);
+  for (let k = 0; k < M; k++) for (let j = 0; j < M; j++) for (let i = 0; i < M; i++) {
+    if (sdf(-span + i * step, -span + j * step, -span + k * step) < 0) solid[at(i, j, k)] = 1;
+  }
+  const c = (M - 1) >> 1;
+  if (!solid[at(c, c, c)]) return size * 0.5;   // origin not in rock; caller's default
+  const seen = new Uint8Array(M * M * M);
+  const stack = [at(c, c, c)];
+  seen[at(c, c, c)] = 1;
+  let far = 0;
+  while (stack.length) {
+    const id = stack.pop();
+    const i = id % M, j = ((id / M) | 0) % M, k = (id / (M * M)) | 0;
+    const x = -span + i * step, y = -span + j * step, z = -span + k * step;
+    far = Math.max(far, Math.abs(x), Math.abs(y), Math.abs(z));
+    const nb = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+    for (const [a, b, d] of nb) {
+      const ii = i + a, jj = j + b, kk = k + d;
+      if (ii < 0 || jj < 0 || kk < 0 || ii >= M || jj >= M || kk >= M) continue;
+      const nid = at(ii, jj, kk);
+      if (!seen[nid] && solid[nid]) { seen[nid] = 1; stack.push(nid); }
+    }
+  }
+  return (far + step) || size * 0.5;
+}
+
+/**
+ * Half-extents of the origin-connected block along each axis, plus the radius
+ * that governs how much weathering it can survive.
+ *
+ * The retreat budget must scale with the SHORTEST半 axis, not the longest. A
+ * columnar block can be 3:1 (0.85 x 2.72 x 0.85 was measured for one default
+ * seed); budgeting off its long axis asks for more retreat than the thin axis
+ * physically has, and the solver eats the column before the corners round.
+ */
+export function blockAxes(sdf, size) {
+  const M = 48, span = size * 4, step = (2 * span) / (M - 1);
+  const at = (i, j, k) => (k * M + j) * M + i;
+  const solid = new Uint8Array(M * M * M);
+  for (let k = 0; k < M; k++) for (let j = 0; j < M; j++) for (let i = 0; i < M; i++) {
+    if (sdf(-span + i * step, -span + j * step, -span + k * step) < 0) solid[at(i, j, k)] = 1;
+  }
+  const c = (M - 1) >> 1;
+  if (!solid[at(c, c, c)]) return { max: size * 0.5, min: size * 0.5 };
+  const seen = new Uint8Array(M * M * M), stack = [at(c, c, c)];
+  seen[at(c, c, c)] = 1;
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  while (stack.length) {
+    const id = stack.pop();
+    const i = id % M, j = ((id / M) | 0) % M, k = (id / (M * M)) | 0;
+    const p = [-span + i * step, -span + j * step, -span + k * step];
+    for (let d = 0; d < 3; d++) { if (p[d] < lo[d]) lo[d] = p[d]; if (p[d] > hi[d]) hi[d] = p[d]; }
+    for (const [a, b, d] of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) {
+      const ii = i + a, jj = j + b, kk = k + d;
+      if (ii < 0 || jj < 0 || kk < 0 || ii >= M || jj >= M || kk >= M) continue;
+      const nid = at(ii, jj, kk);
+      if (!seen[nid] && solid[nid]) { seen[nid] = 1; stack.push(nid); }
+    }
+  }
+  const half = [0, 1, 2].map((d) => 0.5 * (hi[d] - lo[d]) + step);
+  const centre = [0, 1, 2].map((d) => 0.5 * (hi[d] + lo[d]));
+  // The grid is centred on the ORIGIN, but the block's bounding box need not be
+  // (joints cut it asymmetrically). The domain has to reach the far corner of
+  // that box measured from the origin, not merely the box's own half-width.
+  const reach = Math.max(...[0, 1, 2].map((d) => Math.abs(centre[d]) + half[d]));
+  return { max: reach, min: Math.min(...half), half, centre };
+}
+
 export function generateRock(params = {}, onProgress = () => {}) {
   const P = { ...DEFAULT_PARAMS, ...params, weathering: { ...DEFAULT_WEATHERING, ...(params.weathering || {}) } };
   const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
@@ -67,7 +156,25 @@ export function generateRock(params = {}, onProgress = () => {}) {
   });
 
   // Domain: enough headroom that the block never touches the grid boundary.
-  const extent = P.size * 0.95;
+  //
+  // Measured, not guessed: with the default orthogonal joint set the block
+  // reaches 0.88 * size along +z (joint spacing is per-set and anisotropic, so
+  // the half-diagonal is NOT size/2). Against the old extent of 0.95 * size
+  // that left 2 voxels of air, and the solver freezes a 1-cell boundary shell,
+  // so the surface was pinned against the domain wall. dualContour cannot close
+  // a surface that runs off the edge of the grid: the mesh came out with 316
+  // boundary edges, and an open mesh makes the divergence-theorem volume (and
+  // therefore sphericity) meaningless.
+  //
+  // Derive the extent from the block's actual support plus room for the
+  // retreat budget and the frozen shell.
+  // Weathering only ever REMOVES rock, so the domain needs no allowance for the
+  // retreat budget -- just the block plus the frozen boundary shell and a
+  // little slack for the narrow band. Padding beyond that is not free: it
+  // spends grid resolution on air.
+  const axes = blockAxes(block.sdf, P.size);
+  const reach = axes.max;
+  const extent = reach * 1.06;
   const field = new Field3(P.resolution, extent);
   field.fill(block.sdf);
   // Only the band needs to be metric; capping the sweep keeps this off the
@@ -79,7 +186,7 @@ export function generateRock(params = {}, onProgress = () => {}) {
   const grains = new GrainField(litho, P.seed * 7919 + 13);
 
   // --- 3. weathering -----------------------------------------------------
-  const wres = weather(field, grains, P.weathering, (f) => onProgress(0.12 + 0.6 * f, 'weathering'));
+  const wres = weather(field, grains, { ...P.weathering, blockRadius: axes.min }, (f) => onProgress(0.12 + 0.6 * f, 'weathering'));
   onProgress(0.74, 'meshing');
 
   // --- 4. meshing --------------------------------------------------------
