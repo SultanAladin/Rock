@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "test": "node tools/checkwgsl.mjs && node tools/checkgpu.mjs && node tools/checkcamera.mjs && node tools/checkapp.mjs && node tools/checkuniforms.mjs && node tools/checkglsl.mjs && node tools/checkwinding.mjs && node tools/checkhash.mjs",
     "preview": "vite preview --host 0.0.0.0"
   },
   "repository": {
@@ -25,7 +26,9 @@
   },
   "devDependencies": {
     "@shaderfrog/glsl-parser": "^7.0.1",
-    "puppeteer": "^25.9.0"
+    "@webgpu/types": "^0.1.72",
+    "puppeteer": "^25.9.0",
+    "wgsl_reflect": "^1.5.0"
   },
   "type": "module"
 }

@@ -88,11 +88,12 @@ export function buildUI(root, state, ctx) {
   // ---- header -----------------------------------------------------------
   const head = el('div', 'panel-head');
   head.innerHTML = `<h1>Granite Boulder Forge</h1>
-    <p>Joint-block structure &rarr; crystal aggregate &rarr; curvature-driven level-set weathering &rarr; dual contouring.</p>
-    <p class="build">build ${ctx.BUILD}</p>`;
+    <p>Joint-block structure &rarr; crystal aggregate &rarr; curvature-driven level-set weathering,
+       solved and raymarched entirely on the GPU.</p>
+    <p class="build">build ${ctx.BUILD}${ctx.gpu ? ' &middot; ' + ctx.gpu : ''}</p>`;
   root.appendChild(head);
 
-  const genBtn = el('button', 'primary', 'Generate batch');
+  const genBtn = el('button', 'primary', 'New boulder');
   genBtn.onclick = ctx.onGenerate;
   root.appendChild(genBtn);
 
@@ -103,13 +104,79 @@ export function buildUI(root, state, ctx) {
   const statsBox = el('div', 'stats');
   root.appendChild(statsBox);
 
+  // ---- live solve transport ---------------------------------------------
+  // The solver runs in the render loop, so these are transport controls over a
+  // simulation that is already running, not a job queue.
+  let scrubbing = false;
+  const solveBox = el('div', 'solve');
+  const trow = el('div', 'transport');
+  const playBtn = el('button', 'tbtn', '\u23f8');
+  playBtn.title = 'Pause / resume the erosion';
+  let playing = true;
+  playBtn.onclick = () => {
+    playing = !playing;
+    playBtn.textContent = playing ? '\u23f8' : '\u25b6';
+    ctx.onPlayPause && ctx.onPlayPause(playing);
+  };
+  const stepBtn = el('button', 'tbtn', '\u23ed');
+  stepBtn.title = 'Advance one iteration';
+  stepBtn.onclick = () => {
+    if (playing) playBtn.onclick();
+    ctx.onStepOnce && ctx.onStepOnce();
+  };
+  const restartBtn = el('button', 'tbtn', '\u21ba');
+  restartBtn.title = 'Restart the solve from the fresh joint block';
+  restartBtn.onclick = ctx.onGenerate;
+  trow.appendChild(playBtn); trow.appendChild(stepBtn); trow.appendChild(restartBtn);
+
+  const scrub = el('input');
+  scrub.type = 'range'; scrub.min = 0; scrub.max = 1000; scrub.step = 1; scrub.value = 0;
+  scrub.className = 'scrub';
+  scrub.oninput = () => { scrubbing = true; };
+  scrub.onchange = () => {
+    ctx.onScrub && ctx.onScrub(parseInt(scrub.value, 10) / 1000);
+    scrubbing = false;
+  };
+  trow.appendChild(scrub);
+  solveBox.appendChild(trow);
+  const solveStats = el('div', 'solve-stats');
+  solveBox.appendChild(solveStats);
+  root.appendChild(solveBox);
+
+  const perf = section(root, 'Performance');
+  slider(perf, 'Iterations per frame', state, 'stepsPerFrame', 1, 32, 1);
+  slider(perf, 'Render scale', state, 'quality', 0.4, 1.5, 0.05);
+  const noteP = el('p', 'note');
+  noteP.innerHTML = 'Every iteration you see is a real level-set step on the GPU: the raymarcher reads the same buffer the solver writes, so nothing is baked and nothing is re&#8209;meshed to display it.';
+  perf.appendChild(noteP);
+
   // ---- batch ------------------------------------------------------------
   const b = section(root, 'Batch');
-  slider(b, 'Count', state, 'batch', 1, 24, 1);
-  toggle(b, 'Progressive (draft pass first)', state, 'progressive');
-  slider(b, 'Master seed', state.params, 'seed', 1, 9999, 1);
+  slider(b, 'Count', state, 'batch', 1, 24, 1, () => { renderBatch(); ctx.onParams(); });
+  slider(b, 'Master seed', state.params, 'seed', 1, 9999, 1, ctx.onParams);
+  // Variant picker. A "batch" here is a set of parameter variants; each solves
+  // in milliseconds on the GPU, so switching is instant rather than a queue.
+  const batchRow = el('div', 'chips');
+  b.appendChild(batchRow);
+  const renderBatch = () => {
+    batchRow.innerHTML = '';
+    if (state.batch <= 1) { batchRow.style.display = 'none'; return; }
+    batchRow.style.display = '';
+    for (let i = 0; i < state.batch; i++) {
+      const c = el('div', 'chip' + (i === state.selected ? ' on' : ''), String(i + 1));
+      c.onclick = () => {
+        state.selected = i;
+        renderBatch();
+        ctx.onSelect && ctx.onSelect(i);
+      };
+      batchRow.appendChild(c);
+    }
+  };
+  renderBatch();
   slider(b, 'Size spread &sigma; (log-normal)', state.spread, 'sizeSigma', 0, 1.0, 0.01);
   slider(b, 'Weathering spread &sigma;', state.spread, 'weatherSigma', 0, 1.2, 0.01);
+  slider(b, 'Size spread &sigma; (log-normal)', state.spread, 'sizeSigma', 0, 1.0, 0.01, ctx.onParams);
+  slider(b, 'Weathering spread &sigma;', state.spread, 'weatherSigma', 0, 1.2, 0.01, ctx.onParams);
   multi(b, 'Lithology mix', Object.keys(ctx.LITHOLOGIES).map((k) => [k, ctx.LITHOLOGIES[k].label.split(' ')[0]]),
     [], (v) => { state.spread.lithoMix = v.length ? v : null; });
   multi(b, 'Joint-style mix', Object.keys(ctx.JOINT_STYLES).map((k) => [k, k]),
@@ -118,12 +185,12 @@ export function buildUI(root, state, ctx) {
   // ---- structure --------------------------------------------------------
   const st = section(root, 'Structure \u2014 jointing');
   select(st, 'Joint style', state.params, 'jointStyle',
-    Object.keys(ctx.JOINT_STYLES).map((k) => [k, ctx.JOINT_STYLES[k].label]));
-  slider(st, 'Block size (m)', state.params, 'size', 0.15, 3.0, 0.01);
-  slider(st, 'Aspect variation', state.params, 'aspectVariation', 0, 0.9, 0.01);
-  slider(st, 'Joint-surface roughness', state.params, 'jointRoughness', 0, 3.0, 0.02);
-  slider(st, 'Hurst exponent H', state.params, 'hurst', 0.5, 1.0, 0.01);
-  slider(st, 'Sheeting curvature', state.params, 'sheetingCurvature', 0, 1.5, 0.01);
+    Object.keys(ctx.JOINT_STYLES).map((k) => [k, ctx.JOINT_STYLES[k].label]), ctx.onParams);
+  slider(st, 'Block size (m)', state.params, 'size', 0.15, 3.0, 0.01, ctx.onParams);
+  slider(st, 'Aspect variation', state.params, 'aspectVariation', 0, 0.9, 0.01, ctx.onParams);
+  slider(st, 'Joint-surface roughness', state.params, 'jointRoughness', 0, 3.0, 0.02, ctx.onParams);
+  slider(st, 'Hurst exponent H', state.params, 'hurst', 0.5, 1.0, 0.01, ctx.onParams);
+  slider(st, 'Sheeting curvature', state.params, 'sheetingCurvature', 0, 1.5, 0.01, ctx.onParams);
   const note1 = el('p', 'note');
   note1.innerHTML = 'H&nbsp;&asymp;&nbsp;0.8 is the measured self-affine exponent of mode&#8209;I fracture surfaces in granite. Lower&nbsp;H = harsher, more angular fracture faces.';
   st.appendChild(note1);
@@ -131,7 +198,7 @@ export function buildUI(root, state, ctx) {
   // ---- petrology --------------------------------------------------------
   const pt = section(root, 'Petrology');
   select(pt, 'Lithology', state.params, 'lithology',
-    Object.keys(ctx.LITHOLOGIES).map((k) => [k, ctx.LITHOLOGIES[k].label]));
+    Object.keys(ctx.LITHOLOGIES).map((k) => [k, ctx.LITHOLOGIES[k].label]), ctx.onParams);
   const modeBox = el('div', 'modes');
   pt.appendChild(modeBox);
   const renderModes = () => {
@@ -154,32 +221,31 @@ export function buildUI(root, state, ctx) {
   // ---- weathering -------------------------------------------------------
   const w = section(root, 'Weathering \u2014 level-set solver');
   const W = state.params.weathering;
-  slider(w, 'Exposure age', W, 'years', 0, 3.0, 0.01);
-  slider(w, 'Spheroidal rate A<sub>sph</sub>', W, 'spheroidal', 0, 3.0, 0.02);
-  slider(w, 'Spheroidal exponent p', W, 'spheroidalPower', 0.6, 2.2, 0.02);
-  slider(w, 'Cavernous (tafoni) A<sub>cav</sub>', W, 'cavernous', 0, 2.0, 0.02);
-  slider(w, 'Cavernous exponent q', W, 'cavernousPower', 0.8, 3.0, 0.02);
-  slider(w, 'Uniform lowering', W, 'uniform', 0, 0.5, 0.005);
-  slider(w, 'Grussification (mineral selectivity)', W, 'grussification', 0, 2.0, 0.02);
-  slider(w, 'Basal moisture gradient', W, 'moistureGradient', 0, 2.0, 0.02);
-  slider(w, 'Buried fraction', W, 'buriedFraction', 0, 0.6, 0.01);
-  slider(w, 'Insolation / aspect bias', W, 'insolation', 0, 1.0, 0.01);
-  slider(w, 'Rindlet amplitude', W, 'rindlet', 0, 1.2, 0.01);
-  slider(w, 'Rindlet spacing (mm)', W, 'rindletSpacing', 0.01, 0.12, 0.001, null, (v) => (v * 1000).toFixed(0));
-  slider(w, 'Shelter radius (m)', W, 'shelterRadius', 0.05, 0.6, 0.005);
-  slider(w, 'Solver steps', W, 'steps', 10, 240, 1);
+  slider(w, 'Exposure age', W, 'years', 0, 3.0, 0.01, ctx.onParams);
+  slider(w, 'Spheroidal rate A<sub>sph</sub>', W, 'spheroidal', 0, 3.0, 0.02, ctx.onParams);
+  slider(w, 'Spheroidal exponent p', W, 'spheroidalPower', 0.6, 2.2, 0.02, ctx.onParams);
+  slider(w, 'Cavernous (tafoni) A<sub>cav</sub>', W, 'cavernous', 0, 2.0, 0.02, ctx.onParams);
+  slider(w, 'Cavernous exponent q', W, 'cavernousPower', 0.8, 3.0, 0.02, ctx.onParams);
+  slider(w, 'Uniform lowering', W, 'uniform', 0, 0.5, 0.005, ctx.onParams);
+  slider(w, 'Grussification (mineral selectivity)', W, 'grussification', 0, 2.0, 0.02, ctx.onParams);
+  slider(w, 'Basal moisture gradient', W, 'moistureGradient', 0, 2.0, 0.02, ctx.onParams);
+  slider(w, 'Buried fraction', W, 'buriedFraction', 0, 0.6, 0.01, ctx.onParams);
+  slider(w, 'Insolation / aspect bias', W, 'insolation', 0, 1.0, 0.01, ctx.onParams);
+  slider(w, 'Rindlet amplitude', W, 'rindlet', 0, 1.2, 0.01, ctx.onParams);
+  slider(w, 'Rindlet spacing (mm)', W, 'rindletSpacing', 0.01, 0.12, 0.001, ctx.onParams, (v) => (v * 1000).toFixed(0));
+  slider(w, 'Shelter radius (m)', W, 'shelterRadius', 0.05, 0.6, 0.005, ctx.onParams);
   const note2 = el('p', 'note');
   note2.innerHTML = 'Rate &prop; mean curvature: corners see three joint faces of attack, edges two, faces one \u2014 the mechanism behind corestone rounding. Concave shelter feedback drives tafoni. Rindlet spacing of 35&ndash;50&nbsp;mm matches field measurement on granite corestones.';
   w.appendChild(note2);
 
   // ---- mesh -------------------------------------------------------------
-  const m = section(root, 'Mesh', true);
-  slider(m, 'Grid resolution', state.params, 'resolution', 32, 128, 4);
+  const m = section(root, 'Solver grid & mesh export', true);
+  slider(m, 'Grid resolution', state.params, 'resolution', 32,
+    ctx.maxResolution || 128, 4, ctx.onParams);
   slider(m, 'Arris sharpness (QEF)', state.params, 'sharpness', 0, 1, 0.01);
   slider(m, 'Taubin smoothing passes', state.params, 'smoothing', 0, 6, 1);
-  slider(m, 'Grain micro-relief', state.params, 'microReliefAmount', 0, 3, 0.02);
   const note3 = el('p', 'note');
-  note3.innerHTML = 'Dual contouring, not marching cubes: the QEF vertex placement keeps fresh joint arrises razor&#8209;sharp while weathered shoulders stay smooth. Cost is O(steps&nbsp;&times;&nbsp;N&sup3;) \u2014 128&sup3; is slow.';
+  note3.innerHTML = 'The viewport raymarches the signed&#8209;distance field directly, so resolution costs solver accuracy, not frame time. Dual contouring &mdash; QEF vertex placement, which keeps fresh joint arrises razor&#8209;sharp while weathered shoulders stay smooth &mdash; runs only when you export.';
   m.appendChild(note3);
 
   // ---- surface ----------------------------------------------------------
@@ -220,12 +286,6 @@ export function buildUI(root, state, ctx) {
   // ---- export -----------------------------------------------------------
   const ex = section(root, 'Export');
   const erow = el('div', 'row');
-  const selRow = el('div', 'row');
-  selRow.appendChild(el('label', null, 'Selected index'));
-  const selInp = el('input'); selInp.type = 'number'; selInp.min = 0; selInp.value = 0;
-  selInp.oninput = () => { state.selected = Math.max(0, parseInt(selInp.value || '0', 10)); };
-  selRow.appendChild(selInp);
-  ex.appendChild(selRow);
   const mk = (label, fn) => { const btn = el('button', null, label); btn.onclick = fn; erow.appendChild(btn); };
   mk('OBJ', () => ctx.onExport('obj'));
   mk('PLY', () => ctx.onExport('ply'));
@@ -237,19 +297,35 @@ export function buildUI(root, state, ctx) {
   ex.appendChild(note4);
 
   return {
-    setBusy(v) { genBtn.disabled = v; genBtn.textContent = v ? 'Solving\u2026' : 'Generate batch'; },
+    setBusy(v, label) {
+      genBtn.disabled = v;
+      genBtn.textContent = v ? (label || 'Working\u2026') : 'New boulder';
+    },
     setProgress(f) { barFill.style.width = `${(f * 100).toFixed(1)}%`; },
-    setStats(rocks, ms) {
-      if (!rocks.length) { statsBox.innerHTML = ''; return; }
-      const tris = rocks.reduce((a, m) => a + m.userData.stats.triangles, 0);
-      const sph = rocks.reduce((a, m) => a + m.userData.stats.sphericity, 0) / rocks.length;
-      const mass = rocks.reduce((a, m) => a + m.userData.stats.massKg, 0);
-      const solve = rocks.reduce((a, m) => a + m.userData.stats.elapsedMs, 0);
+
+    /** Live solver readout. Called a couple of times a second, not per frame. */
+    setSolve(s) {
+      const frac = s.totalSteps ? s.step / s.totalSteps : 0;
+      barFill.style.width = `${(frac * 100).toFixed(1)}%`;
+      if (!scrubbing) scrub.value = Math.round(frac * 1000);
+      const status = s.stoppedEarly
+        ? '<b class="warn">stopped early</b> <span class="dim">(volume floor reached &mdash; the corestone would have become a cobble and been transported away)</span>'
+        : s.done ? '<b>complete</b>' : `<b>${s.stepsPerSecond}</b> iterations/s`;
+      solveStats.innerHTML = `
+        <div>iteration <b>${s.step}</b> / ${s.totalSteps} &middot; ${status}</div>
+        <div>grid <b>${s.resolution}&sup3;</b> = ${(s.resolution ** 3 / 1000).toFixed(0)}k cells
+             &middot; solid <b>${(s.volumeFraction * 100).toFixed(1)}%</b> of fresh block</div>`;
+    },
+
+    setExportStats(e) {
+      const mass = e.massKg > 1000 ? `${(e.massKg / 1000).toFixed(2)} t` : `${e.massKg.toFixed(0)} kg`;
       statsBox.innerHTML = `
-        <div><b>${rocks.length}</b> boulders &middot; <b>${(tris / 1000).toFixed(0)}k</b> tris</div>
-        <div>mean Wadell sphericity <b>${sph.toFixed(3)}</b> <span class="dim">(field corestones 0.75&ndash;0.90)</span></div>
-        <div>total mass <b>${mass > 1000 ? (mass / 1000).toFixed(2) + ' t' : mass.toFixed(0) + ' kg'}</b> <span class="dim">@ 2680 kg/m&sup3;</span></div>
-        <div>wall <b>${(ms / 1000).toFixed(2)} s</b> &middot; solver CPU <b>${(solve / 1000).toFixed(2)} s</b></div>`;
+        <div>exported <b>${(e.triangles / 1000).toFixed(1)}k</b> triangles &middot;
+             <b>${(e.vertices / 1000).toFixed(1)}k</b> vertices</div>
+        <div>Wadell sphericity <b>${e.sphericity.toFixed(3)}</b>
+             <span class="dim">(field corestones 0.75&ndash;0.90)</span></div>
+        <div>volume <b>${e.volume.toFixed(4)} m&sup3;</b> &middot; mass <b>${mass}</b>
+             <span class="dim">@ 2680 kg/m&sup3;</span></div>`;
     },
   };
 }

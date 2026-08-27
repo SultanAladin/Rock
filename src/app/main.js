@@ -47,7 +47,9 @@ scene.add(new THREE.HemisphereLight(0x5c7899, 0x3a3026, 0.7));
 // --------------------------------------------------------------- app state
 const state = {
   params: structuredClone(DEFAULT_PARAMS),
-  batch: 1,
+  // Batch size. Overridable per-URL (?count=N) so a stale cached bundle can be
+  // ruled out from the address bar without touching the code.
+  batch: Math.max(1, parseInt(new URLSearchParams(location.search).get('count') || '1', 10) || 1),
   progressive: true,
   spread: { sizeSigma: 0.35, weatherSigma: 0.45, styleMix: null, lithoMix: null },
   shading: {
