@@ -298,6 +298,7 @@ function exportAll(fmt) {
 // ---------------------------------------------------------------------- UI
 const ui = buildUI(document.getElementById('panel'), state, {
   LITHOLOGIES, JOINT_STYLES, DEFAULT_WEATHERING,
+  BUILD: __BUILD__,
   onGenerate: generateBatch,
   onShading: applyShading,
   onEnv: () => { updateSun(); applyShading(); },

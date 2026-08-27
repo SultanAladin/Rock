@@ -88,7 +88,8 @@ export function buildUI(root, state, ctx) {
   // ---- header -----------------------------------------------------------
   const head = el('div', 'panel-head');
   head.innerHTML = `<h1>Granite Boulder Forge</h1>
-    <p>Joint-block structure &rarr; crystal aggregate &rarr; curvature-driven level-set weathering &rarr; dual contouring.</p>`;
+    <p>Joint-block structure &rarr; crystal aggregate &rarr; curvature-driven level-set weathering &rarr; dual contouring.</p>
+    <p class="build">build ${ctx.BUILD}</p>`;
   root.appendChild(head);
 
   const genBtn = el('button', 'primary', 'Generate batch');

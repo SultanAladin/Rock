@@ -19,3 +19,19 @@ for (const [n,code] of [['VERT',vert],['FRAG',frag]]) {
   try { parser.parse(code); console.log(n,'OK', code.split('\n').length,'lines'); }
   catch(e){ console.log(n,'FAIL', e.message.split('\n').slice(0,6).join('\n')); }
 }
+
+// Regression guard: a stray backtick inside a /* glsl */`...` template silently
+// TRUNCATES the shader (the literal closes early) and the rest of the file is
+// parsed as JS. The GLSL still "parses" because a prefix of a shader is often
+// valid, so this must be checked by length, not by parse success.
+const MIN = { VERT: 25, FRAG: 400 };
+let bad = 0;
+for (const [n, code] of [['VERT', vert], ['FRAG', frag]]) {
+  const lines = code.split('\n').length;
+  if (lines < MIN[n]) { console.log(`${n} TRUNCATED: ${lines} lines, expected >= ${MIN[n]}`); bad = 1; }
+  if (!/void main\(\)/.test(code)) { console.log(`${n} missing main()`); bad = 1; }
+}
+// fragment must write its output
+if (!/fragColor\s*=/.test(frag)) { console.log('FRAG never writes fragColor'); bad = 1; }
+console.log(bad ? 'FAIL' : 'PASS');
+process.exit(bad);

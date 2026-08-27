@@ -160,30 +160,76 @@ vec3 F_Schlick(vec3 f0, float u){
 // -------------------------------------------- grain-scale height for normals
 // Scalar micro-height: hard minerals proud, grain boundaries grooved, mica
 // pits. Differentiated analytically below to perturb the normal.
+// Micro-relief height field.
+//
+// CONTINUITY IS MANDATORY HERE. This field gets finite-differenced to perturb
+// the shading normal, so any step discontinuity differentiates to a spike of
+// height (delta_h / epsilon) -- with 4 mm grains and epsilon 0.35 mm a single
+// grain-boundary crossing produced gradients of 10-20 against a perturbation
+// strength of ~1, randomising the normal on every boundary pixel. That is what
+// made the surface read as static/speckle rather than stone.
+//
+// Two things made it discontinuous and both are fixed:
+//  1. proud is constant per crystal, so it JUMPED at every grain boundary.
+//     Now it is faded out by the boundary proximity itself, so neighbouring
+//     crystals both approach zero relief at their shared boundary and the
+//     field is continuous across it. Physically this is also more correct: the
+//     etched groove IS the boundary, and a crystal's proud face tapers into it
+//     rather than meeting its neighbour at a cliff.
+//  2. fract() sawtooths are C0-discontinuous once per period. Replaced with
+//     sin(), which carries the same cleavage-step periodicity smoothly.
 float microHeight(vec3 p){
   Grain g = sampleGrain(p);
   float hardness = uMinProps[g.id].y;
-  float proud = (hardness - 5.6) / 4.5;
-  float groove = -(1.0 - g.boundary) * 0.45;
+  // taper to zero at the grain boundary -> continuous across crystals
+  float interior = smoothstep(0.0, 0.45, g.boundary);
+  float proud = ((hardness - 5.6) / 4.5) * interior;
+  // the groove itself: deepest exactly at the boundary
+  float groove = -(1.0 - interior) * 0.45;
   // intragranular relief: conchoidal chipping on quartz, stepped cleavage on
-  // feldspar, flaky steps on mica
+  // feldspar, flaky steps on mica. Also faded at boundaries.
   float cleav = uMinProps[g.id].w;
-  float intra = 0.0;
+  float intra;
   if(cleav < 0.5)      intra = 0.35 * fbmH(p / max(g.size,1e-4) * 3.1, 771u, 0.62, 3);
-  else if(cleav > 1.5) intra = 0.22 * (fract(dot(p, g.axis) / (g.size*0.28)) - 0.5);
-  else                 intra = 0.30 * (fract(dot(p, g.axis) / (g.size*0.18)) - 0.5);
-  return (proud + groove + intra * 0.6) * g.size;
+  else if(cleav > 1.5) intra = 0.22 * sin(dot(p, g.axis) * 6.2831853 / (g.size*0.28));
+  else                 intra = 0.30 * sin(dot(p, g.axis) * 6.2831853 / (g.size*0.18));
+  return (proud + groove + intra * 0.6 * interior) * g.size;
 }
 
-vec3 perturbNormal(vec3 p, vec3 n, float strength){
-  float e = 0.00035;
+// Perturb the shading normal by the micro-relief gradient.
+//
+// The differencing step is tied to the PIXEL FOOTPRINT, not a fixed constant.
+// A constant epsilon is only valid while a grain covers many pixels; as soon as
+// the camera pulls back and a 4 mm crystal is smaller than a pixel, a fixed
+// epsilon samples uncorrelated crystals and the normal becomes per-pixel white
+// noise -- classic normal-map aliasing, and it does not go away with MSAA
+// because the noise is in the shading, not the geometry.
+//
+// fwidth(p) gives the object-space size of one pixel, so e tracks it. We also
+// fade the whole perturbation out once the footprint exceeds the grain size:
+// below that scale the correct answer is not "random normals" but "the average
+// of many crystals", i.e. the unperturbed normal with slightly raised
+// roughness, which is what a real rough surface does at distance.
+vec3 perturbNormal(vec3 p, vec3 n, float strength, out float subpixel){
+  float fw = max(1e-6, length(fwidth(p)));
+  Grain g = sampleGrain(p);
+  // how many pixels across is one crystal
+  float grainPx = g.size / fw;
+  subpixel = 1.0 - smoothstep(1.0, 3.0, 1.0 / max(grainPx, 1e-6));
+  if(subpixel <= 0.001) return n;
+
+  float e = max(fw * 0.9, g.size * 0.06);
   float h0 = microHeight(p);
   vec3 t1 = normalize(abs(n.y) < 0.9 ? cross(vec3(0,1,0), n) : cross(vec3(1,0,0), n));
   vec3 t2 = cross(n, t1);
   float hx = microHeight(p + t1*e);
   float hy = microHeight(p + t2*e);
   vec3 grad = ((hx - h0) * t1 + (hy - h0) * t2) / e;
-  return normalize(n - strength * grad);
+  // Clamp the slope. Even a continuous field can be locally steep, and a normal
+  // tilted past grazing produces black speckle under the BRDF.
+  float gl = length(grad);
+  if(gl > 2.0) grad *= 2.0 / gl;
+  return normalize(n - strength * subpixel * grad);
 }
 
 // ------------------------------------------------------------- lichen field
@@ -239,7 +285,14 @@ void main(){
   }
 
   // ---------------- micro-relief normal ---------------------------------
-  N = normalize(mix(N, perturbNormal(vObj, N, uMicroRelief * 0.9), 1.0));
+  float subpixel;
+  N = perturbNormal(vObj, N, uMicroRelief * 0.9, subpixel);
+  // Detail lost to the sub-pixel fade is not discarded, it is folded into
+  // roughness (LEAN/Toksvig-style): geometric micro-relief that can no longer
+  // be resolved as normal variation still scatters light, so a distant rock
+  // must get rougher rather than smoother. Without this the fade would make
+  // far boulders look polished.
+  float lostDetail = (1.0 - subpixel) * uMicroRelief;
 
   // ---------------- base mineral colour ---------------------------------
   float cj = (g.jitter - 0.5);
@@ -347,8 +400,14 @@ void main(){
   float flash = 0.0;
   if(cleavage > 0.5){
     float sharpAlign = pow(saturate((align - 0.86) / 0.14), 2.0);
-    flash = sharpAlign * (cleavage > 1.5 ? 0.7 : 1.0) * (1.0 - grus*0.8) * (1.0 - lich);
+    // Gate on subpixel for the same reason as the normal perturbation: a
+    // near-mirror lobe on crystals smaller than a pixel cannot be integrated by
+    // point sampling and turns into firefly speckle. Once grains go sub-pixel
+    // the flash is folded into general roughness instead (above).
+    flash = sharpAlign * subpixel * (cleavage > 1.5 ? 0.7 : 1.0) * (1.0 - grus*0.8) * (1.0 - lich);
   }
+  // fold unresolvable micro-relief into roughness before the specular lobes
+  rough = clamp(rough + 0.22 * lostDetail, 0.0, 1.0);
   float roughFlash = mix(rough, 0.035, flash);
 
   float specular = 0.0;
